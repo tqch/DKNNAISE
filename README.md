@@ -6,8 +6,8 @@ The platform for DKNN+AISE.
 ## Functions
 1. Training CNNs and robust CNNs
 2. Training DkNN
-3. Obtain features (CNN representations) of each inputs
-4. Calculating adversarial accuracy of CNNs and DkNN
+3. Obtain features (CNN representations) of each layer from any input
+4. Calculating adversarial accuracy of CNNs and DkNN (under different attack confidence)
 5. More functions will be released
 ## Howto
 0. Change the device (current one is 'cuda:5') to fit your own computing resources. The dataset can be downloaded from its webpage or [here](https://github.com/wangren09/TrojanNetDetector/tree/master/DFTND/cifar10)
