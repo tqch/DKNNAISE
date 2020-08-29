@@ -10,20 +10,19 @@ class GenAdapt:
     '''
     core component of AISE B-cell generation
     '''
-    def __init__(self,mut_range,mut_norm=2):
+    def __init__(self, mut_range, mut_prob):
         self.mut_range = mut_range
-        self.mut_norm=mut_norm
-        # self.fitness_func = fitness_function
+        self.mut_prob = mut_prob
 
     def crossover(self,p1,p2,select_prob):
-        assert p1.ndim == 1 and p2.ndim == 1, "Number of dimension should be 1"
+        assert p1.ndim == 1 and p2.ndim == 1, "Number of dimensions should be 1"
         crossover_mask = np.random.random(p1.size(0)) < select_prob
         return torch.where(crossover_mask,p1,p2)
 
-    def child_mut(self,child,mut_prob):
+    def child_mut(self, child):
         mut = 2*torch.rand_like(child)-1 # uniform (-1,1)
         mut = self.mut_range*mut
-        mut_mask = torch.rand(child.size()) < mut_prob
+        mut_mask = torch.rand(child.size()) < self.mut_prob
         child_mut = torch.where(mut_mask, child, child+mut)
         return torch.clamp(child_mut,0,1)
 
@@ -37,7 +36,7 @@ class L2NearestNeighbors(NearestNeighbors):
     def __call__(self,X):
         return self.kneighbors(X,return_distance=False)
 
-def recip_l2(X,Y,eps=1e-6):
+def recip_l2_dist(X,Y,eps=1e-6):
     correction = np.power(euclidean_distances(X,Y),2)+eps
     return 1/np.sqrt(correction)
 
@@ -45,32 +44,81 @@ class AISE:
     '''
     implement the Adaptive Immune System Emulation
     '''
-    def __init__(self,X_orig,y_orig,n_class=10,n_neighbors=10,query_class="l2",
-                 fitness_function=recip_l2,sampling_temperature=.3,max_generation=10,mut_range=.05,mut_norm=2,n_population=1000,memory_threshold=.25,plasma_threshold=.05):
+    def __init__(self,X_orig,y_orig,X_hidden=[],n_layers=0,model=None,input_shape=None,device=torch.device("cuda"),
+                 n_class=10,n_neighbors=10,query_class="l2",norm_order=2,fitness_function=recip_l2_dist,
+                 sampling_temperature=.3,max_generation=10,mut_range=(.08,.15),mut_prob=(.1,.5),decay=None,
+                 n_population=1000,memory_threshold=.25,plasma_threshold=.05):
 
-        # self.model = model.to(device)
-        self.X_orig = X_orig
+        self.model = model
+        self.device = device
+
+        if input_shape is None:
+            self.input_shape = tuple(X_orig.shape[1:]) # mnist: (1,28,28)
+        else:
+            self.input_shape = input_shape
+
+        self.X_orig = X_orig.flatten(start_dim=1)
         self.y_orig = y_orig
-        # self.hidden_repr = hidden_repr
+
+        self.n_layers = n_layers
+
+        self.transform = lambda x,*y: x
+
         self.n_class = n_class
         self.n_neighbors = n_neighbors
         self.query_class = query_class
+        self.norm_order = norm_order
         self.fitness_func = fitness_function
         self.sampl_temp = sampling_temperature
         self.max_generation = max_generation
         self.n_population = self.n_class*self.n_neighbors
         self.mut_range = mut_range
-        self.mut_norm = mut_norm
+        self.mut_prob = mut_prob
+        self.decay = decay
         self.n_population = n_population
         self.plasma_thres = plasma_threshold
         self.memory_thres = memory_threshold
-        # self.device = device
+
+        model.to(device)
+
+        if len(X_hidden) != 0:
+            print("Hidden representation found!")
+            self.X_hidden = [Xh.flatten(start_dim=1) for Xh in X_hidden]
+            if self.n_layers == 0: # override the self.n_layers
+                self.n_layers = len(X_hidden)//2 # pick the shallow half of hidden layers
+            self.mean_norms = self._calc_mean_norms()
+            self.transform = self._get_transform()
+            print("Concatenating the input and hidden representations...")
+        else:
+            self.X_hidden = X_hidden
+
+        self.X_cat = self.transform(self.X_orig,*self.X_hidden)
 
         self.query_objects = self._build_all_query_objects()
 
+    def _calc_mean_norms(self):
+        out = []
+        assert self.X_orig.ndim == 2
+        out.append(torch.norm(self.X_orig,p=self.norm_order,dim=-1).mean().item())
+        for i in range(self.n_layers):
+            Xh = self.X_hidden[i]
+            assert Xh.ndim == 2
+            out.append(torch.norm(Xh,p=self.norm_order,dim=-1).mean().item())
+        return np.array(out)
+
+    def _get_transform(self):
+        weights = 1/self.mean_norms
+        weights = weights/np.sum(weights)
+        def transform(x_orig,*args):
+            x_cat = []
+            x_cat.append(weights[0]*x_orig)
+            for w,arg in zip(weights[1:],args):
+                x_cat.append(w*arg)
+            return torch.cat(x_cat,dim=1)
+        return transform
 
     def _build_class_query_object(self,class_label):
-        X_class = self.X_orig[self.y_orig==class_label]
+        X_class = self.X_cat[self.y_orig==class_label]
         if self.query_class == "l2":
             query_object = L2NearestNeighbors(n_neighbors=self.n_neighbors).fit(X_class)
         return query_object
@@ -92,32 +140,65 @@ class AISE:
         print("done!")
         return abs_ind
 
-    def generate_b_cells(self, ant, nbc_ind):
-        assert ant.ndim == 2, "ant: 2d tensor (n_antigens,n_features)"
-        genadapt = GenAdapt(self.mut_range,self.mut_norm)
-        labels_batch = []
-        bc_batch = []
+    def _transform_to_inner_repr(self, X, reshape=True):
+        '''
+        transform b cells and antigens into inner representations of AISE
+        '''
+        if reshape:
+            inputs = X.view((-1,)+self.input_shape)
+        else:
+            inputs = X
+        X_hidden = []
+        *out_hidden, _ = self.model(inputs.to(self.device))
+        for i in range(self.n_layers):
+            X_hidden.append(out_hidden[i].detach().cpu().flatten(start_dim=1))
+        return self.transform(X.flatten(start_dim=1),*X_hidden)
+
+    def generate_b_cells(self, ant_tran, nbc_ind):
+        assert ant_tran.ndim == 2, "ant: 2d tensor (n_antigens,n_features)"
+        genadapt = GenAdapt(self.mut_range[1],self.mut_prob[1])
+        mem_bc_batch = []
+        pla_bc_batch = []
+        mem_lab_batch = []
+        pla_lab_batch = []
         print("Affinity maturation process starts with population of {}...".format(self.n_population))
-        for n in range(ant.size(0)):
+        for n in range(ant_tran.size(0)):
             curr_gen = torch.cat([self.X_orig[ind[n]] for ind in nbc_ind]) # naive b cells
-            labels = np.repeat(np.arange(self.n_class),self.n_neighbors)
-            for _ in range(self.max_generation):
-                fitness_score = torch.Tensor(self.fitness_func(ant[n].unsqueeze(0),curr_gen)[0])
+            curr_inner_repr = self._transform_to_inner_repr(curr_gen)
+            labels = np.repeat(np.arange(self.n_class), self.n_neighbors)
+            fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_inner_repr)[0])
+            best_pop_fitness = fitness_score.sum().item()
+            decay_coef = (1.,1.)
+            for i in range(self.max_generation):
+                # print("Antigen {} Generation {}".format(n,i))
                 survival_prob = F.softmax(fitness_score/self.sampl_temp,dim=-1)
                 parents_ind = Categorical(probs=survival_prob).sample((self.n_population,))
                 parents = curr_gen[parents_ind]
-                curr_gen = genadapt.child_mut(parents,mut_prob=.15)
+                curr_gen = genadapt.child_mut(parents)
+                curr_inner_repr = self._transform_to_inner_repr(curr_gen)
                 labels = labels[parents_ind.numpy()]
-            fitness_score = torch.Tensor(self.fitness_func(ant[n].unsqueeze(0),curr_gen)[0])
+                fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_inner_repr)[0])
+                pop_fitness = fitness_score.sum().item()
+                if self.decay:
+                    if pop_fitness < best_pop_fitness:
+                        decay_coef = tuple(decay_coef[i]*self.decay[i] for i in range(2))
+                        genadapt = GenAdapt(max(self.mut_range[0],self.mut_range[1]*decay_coef), max(self.mut_prob[0],self.mut_prob[1]*decay_coef))
+                else:
+                    best_pop_fitness = pop_fitness
+            fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0),curr_inner_repr)[0])
             _,fitness_rank = torch.sort(fitness_score)
-            labels_batch.append(labels[fitness_rank[-int(self.memory_thres*labels.size):]])
-            bc_batch.append(curr_gen[fitness_rank[-int(self.memory_thres*labels.size):]])
+            pla_bc_batch.append(curr_gen[fitness_rank[-int(self.plasma_thres*self.n_population):]])
+            pla_lab_batch.append(labels[fitness_rank[-int(self.plasma_thres*self.n_population):]])
+            mem_bc_batch.append(curr_gen[fitness_rank[-int(self.memory_thres*self.n_population):-int(self.plasma_thres*self.n_population)]])
+            mem_lab_batch.append(labels[fitness_rank[-int(self.memory_thres*self.n_population):-int(self.plasma_thres*self.n_population)]])
         print("Memory & plasma B cells generated!")
-        return torch.tensor(np.stack(labels_batch)),torch.cat(bc_batch)
+        return torch.cat(mem_bc_batch),torch.tensor(np.stack(mem_lab_batch)),\
+               torch.cat(pla_bc_batch),torch.tensor(np.stack(pla_lab_batch))
 
     def clonal_expansion(self, ant):
         print("Clonal expansion starts...")
-        nbc_ind = self._query_nns_ind(ant)
-        labels,bcs = self.generate_b_cells(ant,nbc_ind)
-        print("{} B cells generated!".format(bcs.size(0)))
-        return labels,bcs
+        ant_tran = self._transform_to_inner_repr(ant,reshape=False)
+        nbc_ind = self._query_nns_ind(ant_tran)
+        mem_bcs,mem_labs,pla_bcs,pla_labs = self.generate_b_cells(ant_tran,nbc_ind)
+        print("{} plasma B cells and {} memory generated!".format(pla_bcs.size(0),mem_bcs.size(0)))
+        return mem_bcs,mem_labs,pla_bcs,pla_labs
