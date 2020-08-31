@@ -160,7 +160,6 @@ class AISE:
 
     def generate_b_cells(self, ant_tran, nbc_ind):
         assert ant_tran.ndim == 2, "ant: 2d tensor (n_antigens,n_features)"
-        genadapt = GenAdapt(self.mut_range[1],self.mut_prob[1])
         mem_bc_batch = []
         pla_bc_batch = []
         mem_lab_batch = []
@@ -168,6 +167,7 @@ class AISE:
         print("Affinity maturation process starts with population of {}...".format(self.n_population))
         total_fitness_log = []
         for n in range(ant_tran.size(0)):
+            genadapt = GenAdapt(self.mut_range[1], self.mut_prob[1])
             curr_gen = torch.cat([self.X_orig[ind[n]] for ind in nbc_ind]) # naive b cells
             labels = np.repeat(np.arange(self.n_class), self.n_neighbors)
             if self.requires_init:
