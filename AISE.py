@@ -240,7 +240,8 @@ class AISE:
             labels = np.concatenate([self.y_orig[ind[n]] for ind in nbc_ind])
             if self.requires_init:
                 assert self.n_population % (
-                            self.n_class * self.n_neighbors) == 0, "n_population should be divisible by the product of n_class and n_neighbors"
+                            self.n_class * self.n_neighbors) == 0, \
+                    "n_population should be divisible by the product of n_class and n_neighbors"
                 curr_gen = curr_gen.repeat((self.n_population // (self.n_class * self.n_neighbors), 1))
                 curr_gen = genadapt.mutate_random(curr_gen)  # initialize *NOTE: torch.Tensor.repeat <> numpy.repeat
                 labels = np.tile(labels, self.n_population // (self.n_class * self.n_neighbors))
