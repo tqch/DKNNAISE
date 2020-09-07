@@ -6,6 +6,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics.pairwise import euclidean_distances
 import numpy as np
 import math
+from collections import Counter
 
 
 class GenAdapt:
@@ -13,50 +14,62 @@ class GenAdapt:
     core component of AISE B-cell generation
     '''
 
-    def __init__(self, mut_range, mut_prob, combine_prob=0, mode='random'):
+    def __init__(self, mut_range, mut_prob, combine_rate=0.5, hybrid_rate=0.5, mode='random'):
         self.mut_range = mut_range
         self.mut_prob = mut_prob
-        self.combine_prob = combine_prob
+        self.combine_rate = combine_rate
+        self.hybrid_rate = hybrid_rate
         self.mode = mode
 
-    def crossover(self, p1, p2, select_prob):
-        assert p1.ndim == 1 and p2.ndim == 1, "Number of dimensions should be 1"
-        crossover_mask = np.random.random(p1.size(0)) < select_prob
-        return torch.where(crossover_mask, p1, p2)
+    def crossover(self, base1, base2, select_prob):
+        assert base1.ndim == 2 and base2.ndim == 2, "Number of dimensions should be 2"
+        crossover_mask = torch.rand(base1.size()) < select_prob
+        return torch.where(crossover_mask, base1, base2)
 
-    def mutate_random(self, parent):
-        mut = 2 * torch.rand_like(parent) - 1  # uniform (-1,1)
+    def mutate_random(self, base):
+        mut = 2 * torch.rand_like(base) - 1  # uniform (-1,1)
         mut = self.mut_range * mut
-        mut_mask = torch.rand(parent.size()) < self.mut_prob
-        child = torch.where(mut_mask, parent, parent + mut)
+        mut_mask = torch.rand(base.size()) < self.mut_prob
+        child = torch.where(mut_mask, base, base + mut)
         return torch.clamp(child, 0, 1)
 
-    def mutate_guided(self, parent, guidance):
-        mut = (2 * torch.rand_like(parent) - 1) * guidance * self.mut_range  # uniform (-1,1)
-        mut_mask = torch.rand(parent.size()) < self.mut_prob
-        child = torch.where(mut_mask, parent, parent + mut)
+    def mutate_guided(self, base, target):
+        guidance = target - base
+        mut = (2 * torch.rand_like(base) - 1) * guidance * self.mut_range  # uniform (-1,1)
+        mut_mask = torch.rand(base.size()) < self.mut_prob
+        child = torch.where(mut_mask, base, base + mut)
         return torch.clamp(child, 0, 1)
 
-    def mutate_combined(self, parent, guidance):
-        mut = 2 * torch.rand_like(parent) - 1  # uniform (-1,1)
-        # when self.combine_prob is set 0, it degenerate into random mutate
-        combine_mask = torch.rand(parent.size()) < self.combine_prob
+    def mutate_combined(self, base, target):
+        guidance = target - base
+        mut = 2 * torch.rand_like(base) - 1  # uniform (-1,1)
+        # when self.combine_ratio is set 0, it degenerate into random mutate
+        combine_mask = torch.rand(base.size()) < self.combine_rate
         mut = self.mut_range * torch.where(combine_mask, guidance, mut)
-        mut_mask = torch.rand(parent.size()) < self.mut_prob
-        child = torch.where(mut_mask, parent, parent + mut)
+        mut_mask = torch.rand(base.size()) < self.mut_prob
+        child = torch.where(mut_mask, base, base + mut)
         return torch.clamp(child, 0, 1)
 
-    def __call__(self, parent, guidance=None):
+    def hybrid(self, base, target):
+        child = self.crossover(base, target, self.hybrid_rate)
+        child = self.mutate_guided(child, target-base)
+        return child
+
+    def __call__(self, *args):
         if self.mode == "random":
-            return self.mutate_random(parent)
-        if self.mode == "guided":
-            assert guidance is not None, 'guided mutation must have guidance'
-            return self.mutate_guided(parent, guidance)
-        if self.mode == "combined":
-            assert guidance is not None, 'combined mutation should have guidance'
-            return self.mutate_combined(parent, guidance)
+            base, *_ = args
+            return self.mutate_random(base)
         else:
-            raise ValueError("Unsupported mutation type!")
+            assert len(args) == 2
+            base, target = args
+            if self.mode == "guided":
+                return self.mutate_guided(base, target)
+            if self.mode == "combined":
+                return self.mutate_combined(base, target)
+            if self.mode == "hybrid":
+                return self.hybrid(base, target)
+            else:
+                raise ValueError("Unsupported mutation type!")
 
     def proliferate(self, p1, p2, select_prob, mut_prob):
         pass
@@ -86,12 +99,10 @@ class AISE:
     '''
 
     def __init__(self, X_orig, y_orig, X_hidden=[], layer_dims=None, model=None, input_shape=None,
-                 device=torch.device("cuda"),
-                 n_class=10, n_neighbors=10, query_class="l2", norm_order=2, fitness_function=recip_l2_dist,
-                 sampling_temperature=.3, max_generation=20, requires_init=False, mut_range=(.1, .3),
-                 mut_prob=(.1, .3),
-                 mut_mode="guided", combine_prob=0, decay=(.9,.9), n_population=1000, memory_threshold=.25,
-                 plasma_threshold=.05):
+                 device=torch.device("cuda"), n_class=10, n_neighbors=10, query_class="l2", norm_order=2,
+                 fitness_function=recip_l2_dist, sampling_temperature=.3, max_generation=20, requires_init=False,
+                 mut_range=(.1, .3), mut_prob=(.1, .3), mut_mode="combined", combine_rate=0.7, hybrid_rate=.9,
+                 decay=(.9,.9), n_population=1000, memory_threshold=.25, plasma_threshold=.05, return_log=True):
 
         self.model = model
         self.device = device
@@ -126,11 +137,13 @@ class AISE:
             self.mut_prob = (mut_prob, mut_prob)
 
         self.mut_mode = mut_mode
-        self.combine_prob = combine_prob
+        self.combine_rate = combine_rate
+        self.hybrid_rate = hybrid_rate
         self.decay = decay
         self.n_population = n_population
         self.plasma_thres = plasma_threshold
         self.memory_thres = memory_threshold
+        self.return_log = return_log
 
         model.to(device)
 
@@ -225,16 +238,17 @@ class AISE:
             X_hidden.append(out_hidden[i].detach().cpu().flatten(start_dim=1))
         return self.transform(X.flatten(start_dim=1), *X_hidden)
 
-    def generate_b_cells(self, ant_tran, nbc_ind):
+    def generate_b_cells(self, ant_tran, nbc_ind, y_ant=None):
         assert ant_tran.ndim == 2, "ant: 2d tensor (n_antigens,n_features)"
         mem_bc_batch = []
         pla_bc_batch = []
         mem_lab_batch = []
         pla_lab_batch = []
         print("Affinity maturation process starts with population of {}...".format(self.n_population))
-        total_fitness_log = []
+        ant_logs = [] # store the history dict in terms of metrics for antigens
         for n in range(ant_tran.size(0)):
-            genadapt = GenAdapt(self.mut_range[1], self.mut_prob[1], self.combine_prob, mode=self.mut_mode)
+            genadapt = GenAdapt(self.mut_range[1], self.mut_prob[1], self.combine_rate,
+                                self.hybrid_rate, mode=self.mut_mode)
             curr_gen = torch.cat([self.X_orig[ind[n]] for ind in nbc_ind])  # naive b cells
             # labels = np.repeat(np.arange(self.n_class), self.n_neighbors)
             labels = np.concatenate([self.y_orig[ind[n]] for ind in nbc_ind])
@@ -250,7 +264,10 @@ class AISE:
             best_pop_fitness = float('-inf')
             decay_coef = (1., 1.)
             num_plateau = 0
-            curr_fitness_hist = []
+            ant_log = dict() # history log for each antigen
+            pct_true_class_hist = []
+            fitness_true_class_hist = []
+            fitness_pop_hist = []
             for i in range(self.max_generation):
                 # print("Antigen {} Generation {}".format(n,i))
                 survival_prob = F.softmax(fitness_score / self.sampl_temp, dim=-1)
@@ -261,7 +278,14 @@ class AISE:
                 labels = labels[parents_ind.numpy()]
                 fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_inner_repr)[0])
                 pop_fitness = fitness_score.sum().item()
-                curr_fitness_hist.append(pop_fitness)
+                # logging
+                fitness_pop_hist.append(pop_fitness)
+                if y_ant:
+                    true_class_fitness = fitness_score[labels==y_ant[n]]
+                    fitness_true_class_hist.append(true_class_fitness)
+                    true_class_pct = (labels==y_ant[n]).float().mean().item()
+                    pct_true_class_hist.append(true_class_pct)
+                # adaptive shrinkage of certain hyper-parameters
                 if self.decay:
                     assert len(self.decay) == 2
                     if pop_fitness < best_pop_fitness:
@@ -273,30 +297,46 @@ class AISE:
                         num_plateau += 1
                         genadapt = GenAdapt(max(self.mut_range[0], self.mut_range[1] * decay_coef[0]),
                                             max(self.mut_prob[0], self.mut_prob[1] * decay_coef[1]),
-                                            self.combine_prob, mode=self.mut_mode)
+                                            self.combine_rate, self.hybrid_rate, mode=self.mut_mode)
                     else:
                         best_pop_fitness = pop_fitness
             # fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0),curr_inner_repr)[0])
             _, fitness_rank = torch.sort(fitness_score)
-            total_fitness_log.append(curr_fitness_hist)
+            ant_log["fitness_pop"] = fitness_pop_hist
+            if y_ant:
+                ant_log["fitness_true_class"] = fitness_true_class_hist
+                ant_log["pct_true_class"] = pct_true_class_hist
             pla_bc_batch.append(curr_gen[fitness_rank[-int(self.plasma_thres * self.n_population):]])
             pla_lab_batch.append(labels[fitness_rank[-int(self.plasma_thres * self.n_population):]])
             mem_bc_batch.append(curr_gen[fitness_rank[-int(self.memory_thres * self.n_population):-int(
                 self.plasma_thres * self.n_population)]])
             mem_lab_batch.append(labels[fitness_rank[-int(self.memory_thres * self.n_population):-int(
                 self.plasma_thres * self.n_population)]])
+            ant_logs.append(ant_log)
         print("Memory & plasma B cells generated!")
         return torch.cat(mem_bc_batch), torch.tensor(np.stack(mem_lab_batch)), \
                torch.cat(pla_bc_batch), torch.tensor(np.stack(pla_lab_batch)), \
-               total_fitness_log
+               ant_logs
 
     def clonal_expansion(self, ant, return_log=False):
         print("Clonal expansion starts...")
         ant_tran = self._transform_to_inner_repr(ant, reshape=False)
         nbc_ind = self._query_nns_ind(ant_tran)
-        mem_bcs, mem_labs, pla_bcs, pla_labs, fit_log = self.generate_b_cells(ant_tran, nbc_ind)
+        mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = self.generate_b_cells(ant_tran, nbc_ind)
         print("{} plasma B cells and {} memory generated!".format(pla_bcs.size(0), mem_bcs.size(0)))
         if return_log:
-            return mem_bcs, mem_labs, pla_bcs, pla_labs, fit_log
+            return mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs
         else:
             return mem_bcs, mem_labs, pla_bcs, pla_labs
+
+    @staticmethod
+    def predict(*args):
+        assert args
+        if len(args) == 1:
+            pla_labs = args
+        else:
+            pla_labs = args[3]
+        return np.array(list(map(lambda x: Counter(x).most_common(1)[0][0], pla_labs.numpy())))
+
+    def __call__(self, ant):
+        return self.clonal_expansion(ant,self.return_log)

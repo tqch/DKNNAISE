@@ -1,4 +1,4 @@
 torch_practice.ipynb
 datasets
 datasets/MNIST
-*.jpg
+images
