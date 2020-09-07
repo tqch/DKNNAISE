@@ -50,11 +50,11 @@ class GridSearch:
             print('#{}: {}'.format(i+1,dict2str(temp_dict)))
             start_time = time.time()
             self.model.__dict__.update(**temp_dict)
-            *temp_outputs,temp_log = self.model(X)
+            *temp_outputs,temp_log = self.model(X,y)
             y_pred = self.model.predict(*temp_outputs)
             temp_acc = (y_pred==y).astype("float").mean()
             print('acc: {}'.format(temp_acc))
-            result_dict[dict2str(temp_dict)] = {'acc': temp_acc,'log': temp_log}
+            result_dict[dict2str(temp_dict)] = {'y_pred': y_pred, 'acc': temp_acc,'log': temp_log}
             end_time = time.time()
             print('Total running time is {}'.format(end_time-start_time),end="\n\n")
         return result_dict
