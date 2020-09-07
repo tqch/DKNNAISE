@@ -98,7 +98,7 @@ class AISE:
     implement the Adaptive Immune System Emulation
     '''
 
-    def __init__(self, X_orig, y_orig, X_hidden=[], layer_dims=None, model=None, input_shape=None,
+    def __init__(self, X_orig, y_orig, X_hidden=None, layer_dims=[], model=None, input_shape=None,
                  device=torch.device("cuda"), n_class=10, n_neighbors=10, query_class="l2", norm_order=2,
                  fitness_function=recip_l2_dist, sampling_temperature=.3, max_generation=20, requires_init=False,
                  mut_range=(.1, .3), mut_prob=(.1, .3), mut_mode="combined", combine_rate=0.7, hybrid_rate=.9,
@@ -147,7 +147,7 @@ class AISE:
 
         model.to(device)
 
-        if len(X_hidden) != 0:
+        if X_hidden:
             print("Hidden representation found!")
             self.X_hidden = [Xh.flatten(start_dim=1) for Xh in X_hidden]
             if self.layer_dims is None:  # override the self.n_layers
@@ -156,7 +156,6 @@ class AISE:
             self.transform = self._get_transform()
             print("Concatenating the input and hidden representations...")
         else:
-            self.X_hidden = X_hidden
             self.layer_dims = []
 
         self.X_cat = self.transform(self.X_orig, *self.X_hidden)
@@ -176,10 +175,9 @@ class AISE:
         weights = 1 / self.mean_norms
         weights = weights / np.sum(weights)
 
-        def transform(x_orig, *args):
+        def transform(*args):
             x_cat = []
-            # x_cat.append(weights[0]*x_orig)
-            for w, arg in zip(weights[1:], args):
+            for w, arg in zip(weights, args):
                 x_cat.append(w * arg)
             return torch.cat(x_cat, dim=1)
 
