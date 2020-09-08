@@ -23,7 +23,7 @@ class GenAdapt:
 
     def crossover(self, base1, base2, select_prob):
         assert base1.ndim == 2 and base2.ndim == 2, "Number of dimensions should be 2"
-        crossover_mask = torch.rand(base1.size()) < select_prob
+        crossover_mask = torch.rand(base1.size()) < torch.Tensor(select_prob[:,None])
         return torch.where(crossover_mask, base1, base2)
 
     def mutate_random(self, base):
@@ -56,10 +56,20 @@ class GenAdapt:
         child = self.mutate_guided(child, target - base)
         return child
 
+    def crossover_complete(self, parents, select_prob):
+        parent1,parent2 = parents
+        child = self.crossover(parent1,parent2,select_prob)
+        child = self.mutate_random(child)
+        return child
+
     def __call__(self, *args):
         if self.mode == "random":
             base, *_ = args
             return self.mutate_random(base)
+        elif self.mode == "crossover":
+            assert len(args) == 2
+            parents, select_prob = args
+            return self.crossover_complete(parents,select_prob)
         else:
             assert len(args) == 2
             base, target = args
@@ -101,7 +111,7 @@ class AISE:
 
     def __init__(self, X_orig, y_orig, X_hidden=[], layer_dims=[], model=None, input_shape=None,
                  device=torch.device("cuda"), n_class=10, n_neighbors=10, query_class="l2", norm_order=2,
-                 fitness_function=recip_l2_dist, sampling_temperature=.3, max_generation=20, requires_init=False,
+                 fitness_function=neg_l2_dist, sampling_temperature=.3, max_generation=20, requires_init=False,
                  mut_range=(.1, .3), mut_prob=(.1, .3), mut_mode="combined", combine_rate=0.7, hybrid_rate=.9,
                  decay=(.9, .9), n_population=1000, memory_threshold=.25, plasma_threshold=.05, return_log=True):
 
@@ -262,6 +272,7 @@ class AISE:
             curr_gen = torch.cat([self.X_orig[ind[n]] for ind in nbc_ind])  # naive b cells
             # labels = np.repeat(np.arange(self.n_class), self.n_neighbors)
             labels = np.concatenate([self.y_orig[ind[n]] for ind in nbc_ind])
+            static_index = np.arange(len(labels))
             if self.requires_init:
                 assert self.n_population % (
                         self.n_class * self.n_neighbors) == 0, \
@@ -282,11 +293,20 @@ class AISE:
             for i in range(self.max_generation):
                 # print("Antigen {} Generation {}".format(n,i))
                 survival_prob = F.softmax(fitness_score / self.sampl_temp, dim=-1)
-                parents_ind = Categorical(probs=survival_prob).sample((self.n_population,))
-                parents = curr_gen[parents_ind]
-                curr_gen = genadapt(parents, ant[n].unsqueeze(0))
+                parents_ind1 = Categorical(probs=survival_prob).sample((self.n_population,))
+                if self.mut_mode == "crossover":
+                    parents_ind2 = torch.cat([Categorical(probs=F.softmax(fitness_score[labels==labels[ind]] / self.sampl_temp,
+                                                            dim=-1)).sample((1,)) for ind in parents_ind1])
+                    parents_ind2 = [static_index[labels==labels[ind1]][ind2] for ind1,ind2 in zip(parents_ind1,parents_ind2)]
+                    static_index = np.arange(self.n_population)
+                    parents = [curr_gen[parents_ind1],curr_gen[parents_ind2]]
+                    curr_gen = genadapt(parents, fitness_score[parents_ind1] /\
+                                        (fitness_score[parents_ind1]+fitness_score[parents_ind2]))
+                else:
+                    parents = curr_gen[parents_ind1]
+                    curr_gen = genadapt(parents, ant[n].unsqueeze(0))
                 curr_inner_repr = self._transform_to_inner_repr(curr_gen)
-                labels = labels[parents_ind.numpy()]
+                labels = labels[parents_ind1.numpy()]
                 fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_inner_repr)[0])
                 pop_fitness = fitness_score.sum().item()
                 # logging
