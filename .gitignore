@@ -4,4 +4,5 @@ datasets/MNIST
 images
 neural_style_tutorial.ipynb
 gram_fitness.ipynb
-cache 
+cache
+AISE_gridsearch-Copy1.ipynb 

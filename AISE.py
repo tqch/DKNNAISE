@@ -201,7 +201,7 @@ class AISE:
                     x_cat.append(w * arg)
             else:
                 x_cat.append(x_orig)
-            return x_cat[0] if len(x_cat) else torch.cat(x_cat, dim=1)
+            return torch.cat(x_cat, dim=1) if len(x_cat)>1 else x_cat[0]
 
         return transform
 
