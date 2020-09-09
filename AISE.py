@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics.pairwise import euclidean_distances
+from sklearn.preprocessing import normalize
 import numpy as np
 import math
 from collections import Counter
@@ -103,6 +104,13 @@ def recip_l2_dist(X, Y, eps=1e-6):
 def neg_l2_dist(X, Y):
     return -euclidean_distances(X, Y)
 
+def cosine_similarity(X, Y, normalized = False):
+    if not normalized:
+        X_nm = normalize(X, axis=1)
+        Y_nm = normalize(X, axis=1)
+    else:
+        X_nm,Y_nm = X,Y
+    return 1-.5*euclidean_distances(X_nm,Y_nm)
 
 class AISE:
     '''
@@ -111,7 +119,8 @@ class AISE:
 
     def __init__(self, X_orig, y_orig, X_hidden=[], layer_dims=[], model=None, input_shape=None,
                  device=torch.device("cuda"), n_class=10, n_neighbors=10, query_class="l2", norm_order=2,
-                 fitness_function=neg_l2_dist, sampling_temperature=.3, max_generation=20, requires_init=False,
+                 normalize=False,fitness_function=neg_l2_dist, sampling_temperature=.3, max_generation=20,
+                 requires_init=False,
                  mut_range=(.1, .3), mut_prob=(.1, .3), mut_mode="combined", combine_rate=0.7, hybrid_rate=.9,
                  decay=(.9, .9), n_population=1000, memory_threshold=.25, plasma_threshold=.05, return_log=True):
 
@@ -135,6 +144,7 @@ class AISE:
         self.n_neighbors = n_neighbors
         self.query_class = query_class
         self.norm_order = norm_order
+        self.normalize = normalize
         self.fitness_func = fitness_function
         self.sampl_temp = sampling_temperature
         self.max_generation = max_generation
@@ -187,18 +197,23 @@ class AISE:
             out.append(torch.norm(Xh, p=self.norm_order, dim=-1).mean().item())
         return np.array(out)
 
-    def _get_transform(self):
-        if len(self.mean_norms):
-            weights = 1 / self.mean_norms
-            weights = weights / np.sum(weights)
+    def _get_transform(self, weighted = True):
+        indices = self.layer_dims
+        if weighted:
+            if len(self.mean_norms):
+                weights = 1 / self.mean_norms
+                weights = weights / np.sum(weights)
+            else:
+                weights = self.mean_norms
         else:
-            weights = self.mean_norms
+            weights = np.ones(len(indices))
 
         def transform(x_orig, *args):
+            x = [args[i] for i in range(len(args)) if i in indices]
             x_cat = []
-            if len(weights):
-                for w, arg in zip(weights, args):
-                    x_cat.append(w * arg)
+            if len(indices):
+                for w, arg in zip(weights, x):
+                    x_cat.append(w * x)
             else:
                 x_cat.append(x_orig)
             return torch.cat(x_cat, dim=1) if len(x_cat)>1 else x_cat[0]
@@ -244,7 +259,7 @@ class AISE:
             print('done!')
         return abs_ind
 
-    def _transform_to_inner_repr(self, X, reshape=True):
+    def _transform_to_inner_repr(self, X, reshape=True, normalize=False):
         '''
         transform b cells and antigens into inner representations of AISE
         '''
@@ -255,7 +270,10 @@ class AISE:
         X_hidden = []
         *out_hidden, _ = self.model(inputs.to(self.device))
         for i in self.layer_dims:
-            X_hidden.append(out_hidden[i].detach().cpu().flatten(start_dim=1))
+            Xh = out_hidden[i].cpu().flatten(start_dim=1)
+            if normalize:
+                Xh = Xh/Xh.pow(2).sum(dim=1,keepdim=True).sqrt()
+            X_hidden.append(Xh)
         return self.transform(X.flatten(start_dim=1), *X_hidden)
 
     def generate_b_cells(self, ant, ant_tran, nbc_ind, y_ant=None):
@@ -280,7 +298,7 @@ class AISE:
                 curr_gen = curr_gen.repeat((self.n_population // (self.n_class * self.n_neighbors), 1))
                 curr_gen = genadapt.mutate_random(curr_gen)  # initialize *NOTE: torch.Tensor.repeat <> numpy.repeat
                 labels = np.tile(labels, self.n_population // (self.n_class * self.n_neighbors))
-            curr_inner_repr = self._transform_to_inner_repr(curr_gen)
+            curr_inner_repr = self._transform_to_inner_repr(curr_gen,normalize=self.normalize)
             fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_inner_repr)[0])
             best_pop_fitness = float('-inf')
             decay_coef = (1., 1.)
@@ -305,7 +323,7 @@ class AISE:
                 else:
                     parents = curr_gen[parents_ind1]
                     curr_gen = genadapt(parents, ant[n].unsqueeze(0))
-                curr_inner_repr = self._transform_to_inner_repr(curr_gen)
+                curr_inner_repr = self._transform_to_inner_repr(curr_gen,normalize=self.normalize)
                 labels = labels[parents_ind1.numpy()]
                 fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_inner_repr)[0])
                 pop_fitness = fitness_score.sum().item()
@@ -349,14 +367,14 @@ class AISE:
                torch.cat(pla_bc_batch), torch.tensor(np.stack(pla_lab_batch)), \
                ant_logs
 
-    def clonal_expansion(self, ant, y_ant=None, return_log=False):
+    def clonal_expansion(self, ant, y_ant=None):
         print("Clonal expansion starts...")
-        ant_tran = self._transform_to_inner_repr(ant, reshape=False)
+        ant_tran = self._transform_to_inner_repr(ant, reshape=False, normalize=self.normalize)
         nbc_ind = self._query_nns_ind(ant_tran)
         mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = self.generate_b_cells(ant.flatten(start_dim=1), ant_tran,
                                                                                nbc_ind, y_ant)
         print("{} plasma B cells and {} memory generated!".format(pla_bcs.size(0), mem_bcs.size(0)))
-        if return_log:
+        if self.return_log:
             return mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs
         else:
             return mem_bcs, mem_labs, pla_bcs, pla_labs
@@ -383,4 +401,4 @@ class AISE:
         elif len(self.query_objects) != self.n_class:
             self.query_objects = self._build_all_query_objects()
 
-        return self.clonal_expansion(ant, y_ant, self.return_log)
+        return self.clonal_expansion(ant, y_ant)
