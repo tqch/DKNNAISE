@@ -168,7 +168,8 @@ class AISE:
         self.memory_thres = memory_threshold
         self.return_log = return_log
 
-        model.to(device)
+        self.model.to(self.device)
+        self.model.eval()
 
         if self.layer_dims:
             assert X_hidden is not None
@@ -212,8 +213,8 @@ class AISE:
             x = [args[i] for i in range(len(args)) if i in indices]
             x_cat = []
             if len(indices):
-                for w, arg in zip(weights, x):
-                    x_cat.append(w * x)
+                for w, xx in zip(weights, x):
+                    x_cat.append(w * xx)
             else:
                 x_cat.append(x_orig)
             return torch.cat(x_cat, dim=1) if len(x_cat)>1 else x_cat[0]
@@ -268,12 +269,13 @@ class AISE:
         else:
             inputs = X
         X_hidden = []
-        *out_hidden, _ = self.model(inputs.to(self.device))
-        for i in self.layer_dims:
-            Xh = out_hidden[i].cpu().flatten(start_dim=1)
-            if normalize:
-                Xh = Xh/Xh.pow(2).sum(dim=1,keepdim=True).sqrt()
-            X_hidden.append(Xh)
+        with torch.no_grad():
+            *out_hidden, _ = self.model(inputs.to(self.device))
+            for i in self.layer_dims:
+                Xh = out_hidden[i].detach().cpu().flatten(start_dim=1)
+                if normalize:
+                    Xh = Xh/Xh.pow(2).sum(dim=1,keepdim=True).sqrt()
+                X_hidden.append(Xh)
         return self.transform(X.flatten(start_dim=1), *X_hidden)
 
     def generate_b_cells(self, ant, ant_tran, nbc_ind, y_ant=None):
