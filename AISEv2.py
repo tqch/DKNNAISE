@@ -8,11 +8,6 @@ import numpy as np
 import math,time
 from collections import Counter
 
-# this is a hook function to register in the model forward
-def conv_hook(self,input,output):
-    conv_outputs.append(output.detach())
-    return None
-
 class GenAdapt:
     '''
     core component of AISE B-cell generation
@@ -77,11 +72,10 @@ class AISE:
     implement the Adaptive Immune System Emulation
     '''
 
-    def __init__(self, x_orig, y_orig, hidden_layer=None, model=None, input_shape=None,
-                 device=torch.device("cuda"), n_class=10, n_neighbors=10, query_class="l2", norm_order=2,
-                 normalize=False, avg_channel=False, fitness_function=neg_l2_dist, sampling_temperature=.3,
-                 max_generation=20, requires_init=False,
-                 mut_range=(.1, .3), mut_prob=(.1, .3), mut_mode="crossover",
+    def __init__(self, x_orig, y_orig, hidden_layer=None, model=None, input_shape=None, device=torch.device("cuda"),
+                 n_class=10, n_neighbors=10, query_class="l2", norm_order=2,normalize=False,
+                 avg_channel=False, fitness_function=neg_l2_dist, sampling_temperature=.3,
+                 max_generation=30, requires_init=False, mut_range=(.05, .15), mut_prob=(.05, .15), mut_mode="crossover",
                  decay=(.9, .9), n_population=1000, memory_threshold=.25, plasma_threshold=.05, return_log=True):
 
         self.model = model
@@ -174,11 +168,11 @@ class AISE:
         transform b cells and antigens into inner representations of AISE
         '''
         global conv_outputs
-        if self.hidden_layer:
+        if self.hidden_layer is not None:
             xs = []
             for i in range(0,x.size(0),batch_size):
-                conv_outputs = []
-                xx = x[i*batch_size:(i+1)*batch_size]
+                conv_outputs.clear()
+                xx = x[i:i+batch_size]
                 with torch.no_grad():
                     self.model(xx.to(self.device))
                     xh = conv_outputs[self.hidden_layer].detach().cpu()
@@ -188,9 +182,9 @@ class AISE:
                     if self.normalize:
                         xh = xh/xh.pow(2).sum(dim=1,keepdim=True).sqrt()
                     xs.append(xh)
-                return torch.cat(xs)
+            return torch.cat(xs)
         else:
-            return x.flatten(start_dim=1).cpu()
+            return x.flatten(start_dim=1).detach().cpu()
 
     def generate_b_cells(self, ant, ant_tran, nbc_ind, y_ant=None):
         assert ant_tran.ndim == 2, "ant: 2d tensor (n_antigens,n_features)"
@@ -201,6 +195,7 @@ class AISE:
         print("Affinity maturation process starts with population of {}...".format(self.n_population))
         ant_logs = []  # store the history dict in terms of metrics for antigens
         for n in range(ant.size(0)):
+            # print(torch.cuda.memory_summary())
             genadapt = GenAdapt(self.mut_range[1], self.mut_prob[1], mode=self.mut_mode)
             curr_gen = torch.cat([self.x_orig[ind[n]].flatten(start_dim=1) for ind in nbc_ind])  # naive b cells
             labels = np.concatenate([self.y_orig[ind[n]] for ind in nbc_ind])
@@ -224,9 +219,9 @@ class AISE:
                 pct_true_class_hist = []
             for i in range(self.max_generation):
                 survival_prob = F.softmax(fitness_score / self.sampl_temp, dim=-1)
-                parents_ind1 = Categorical(probs=survival_prob).sample((self.n_population,))
+                parents_ind1 = np.array(Categorical(probs=survival_prob).sample((self.n_population,)))
                 if self.mut_mode == "crossover":
-                    parents_ind2 = torch.cat([Categorical(probs=F.softmax(fitness_score[labels==labels[ind]] / self.sampl_temp,
+                    parents_ind2 = np.concatenate([Categorical(probs=F.softmax(fitness_score[labels==labels[ind]] / self.sampl_temp,
                                                           dim=-1)).sample((1,)) for ind in parents_ind1])
                     parents_ind2 = [static_index[labels==labels[ind1]][ind2] for ind1,ind2 in zip(parents_ind1,parents_ind2)]
                     static_index = np.arange(self.n_population)
@@ -237,7 +232,7 @@ class AISE:
                     parents = curr_gen[parents_ind1]
                     curr_gen = genadapt(parents)
                 curr_inner_repr = self._transform_to_inner_repr(curr_gen.view((-1,)+self.x_orig.size()[1:]))
-                labels = labels[parents_ind1.numpy()]
+                labels = labels[parents_ind1]
                 fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_inner_repr)[0])
                 pop_fitness = fitness_score.sum().item()
                 # logging
@@ -301,7 +296,7 @@ class AISE:
         return np.array(list(map(lambda x: Counter(np.array(x)).most_common(1)[0][0], pla_labs)))
 
     def __call__(self, ant, y_ant=None):
-        return self.clonal_expansion(ant, y_ant)
+        return self.clonal_expansion(ant.detach(), y_ant)
 
 if __name__ == "__main__":
     import os,time,pickle
@@ -325,6 +320,12 @@ if __name__ == "__main__":
     net.eval()
     for parameter in net.parameters():
         parameter.requires_grad_(False)
+
+    # this is a hook function to register in the model forward
+    def conv_hook(self, input, output):
+        conv_outputs.append(output.detach())
+        return None
+
     for layer in net.modules():
         if layer.__class__.__name__ == "Conv2d":
             layer.register_forward_hook(conv_hook)
@@ -341,14 +342,14 @@ if __name__ == "__main__":
     x_eval = trainset.data[ind_eval].unsqueeze(1)/255.
     y_eval = trainset.targets[ind_eval]
 
-    conv_outputs = []
-    if os.path.exists("./cache/x_adv_test.pkl"):
-        with open("./cache/x_adv_test.pkl","rb") as f:
+    conv_outputs = [] # this is a global variable!
+    if os.path.exists("./cache/x_adv_{}.pkl".format(N_EVAL)):
+        with open("./cache/x_adv_{}.pkl".format(N_EVAL),"rb") as f:
             x_adv = torch.Tensor(pickle.load(f)).to(DEVICE)
     else:
         x_adv = PGD(eps=40/255.,sigma=20/255.,nb_iter=20,
-                    DEVICE=DEVICE).attack(net,x_eval.to(DEVICE),y_eval.to(DEVICE))
-        with open("./cache/x_adv_test.pkl","wb") as f:
+                    DEVICE=DEVICE).attack(net,x_eval.to(DEVICE),y_eval.to(DEVICE)).detach().to(DEVICE)
+        with open("./cache/x_adv_{}.pkl".format(N_EVAL),"wb") as f:
             pickle.dump(x_adv.detach().cpu().numpy(),f)
     *_, out = net(x_adv)
     y_pred_adv = torch.max(out, 1)[1]
@@ -372,5 +373,5 @@ if __name__ == "__main__":
 
     if not os.path.exists("./results"):
         os.mkdir("./results")
-    with open("results/result_200_v2.pkl","wb") as f:
-        pickle.dump(ant_logs,f)
+    with open("results/result_v2_{}.pkl".format(N_EVAL),"wb") as f:
+        pickle.dump([aise_pred,knn_pred,ant_logs],f)
