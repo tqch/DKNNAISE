@@ -305,15 +305,35 @@ if __name__ == "__main__":
     from mnist_model import *
     from sklearn.neighbors import KNeighborsClassifier
 
+    import argparse
+    parser = argparse.ArgumentParser("AISE Launcher")
+    parser.add_argument("--train-size",help="Training size",type=int)
+    parser.add_argument("--eval-size",help="Evaluation size",type=int)
+    parser.add_argument("--hidden-layer",help="Specify a hidden layer",type=int)
+    parser.add_argument("-c","--use-cache",help="Whether cache is used",action="store_true")
+    parser.add_argument("-a","--avg-channel",help="Whether to average the channels or not",
+                             action="store_true")
+    parser.add_argument("-s","--save-result",help="Whether to save the result or not",action="store_true")
+    parser.add_argument("--device",help="CPU/GPU device")
+    args = parser.parse_args()
+
     ROOT = "./datasets"
     TRANSFORM = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=0.0,std=1.0)
     ])
-    N_TRAIN = 2000
-    N_EVAL = 200
 
-    DEVICE = torch.device("cuda")
+    N_TRAIN = 2000 if not args.train_size else args.train_size
+    N_EVAL = 200 if not args.eval_size else args.eval_size
+    HIDDEN_LAYER = args.hidden_layer
+    AVG_CHANNEL = args.avg_channel
+    USE_CACHE = args.use_cache
+    SAVE_RESULT = args.save_result
+
+    if args.device:
+        DEVICE = torch.device(args.device)
+    else:
+        DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     net = CNN().to(DEVICE)
     net.load_state_dict(torch.load("./models/mnistmodel.pt",map_location=DEVICE)["state_dict"])
@@ -343,21 +363,26 @@ if __name__ == "__main__":
     y_eval = trainset.targets[ind_eval]
 
     conv_outputs = [] # this is a global variable!
-    if os.path.exists("./cache/x_adv_{}.pkl".format(N_EVAL)):
-        with open("./cache/x_adv_{}.pkl".format(N_EVAL),"rb") as f:
-            x_adv = torch.Tensor(pickle.load(f)).to(DEVICE)
+    if USE_CACHE:
+        if os.path.exists("./cache/x_adv_v2_{}.pkl".format(N_EVAL)):
+            with open("./cache/x_adv_v2_{}.pkl".format(N_EVAL),"rb") as f:
+                x_adv = torch.Tensor(pickle.load(f)).to(DEVICE)
+        else:
+            x_adv = PGD(eps=40/255.,sigma=20/255.,nb_iter=20,
+                        DEVICE=DEVICE).attack(net,x_eval.to(DEVICE),y_eval.to(DEVICE)).detach().to(DEVICE)
+            with open("./cache/x_adv_v2_{}.pkl".format(N_EVAL), "wb") as f:
+                pickle.dump(x_adv.detach().cpu().numpy(), f)
     else:
-        x_adv = PGD(eps=40/255.,sigma=20/255.,nb_iter=20,
-                    DEVICE=DEVICE).attack(net,x_eval.to(DEVICE),y_eval.to(DEVICE)).detach().to(DEVICE)
-        with open("./cache/x_adv_{}.pkl".format(N_EVAL),"wb") as f:
-            pickle.dump(x_adv.detach().cpu().numpy(),f)
+        x_adv = PGD(eps=40 / 255., sigma=20 / 255., nb_iter=20,
+                    DEVICE=DEVICE).attack(net, x_eval.to(DEVICE), y_eval.to(DEVICE)).detach().to(DEVICE)
+
     *_, out = net(x_adv)
     y_pred_adv = torch.max(out, 1)[1]
     print('The accuracy of plain cnn under PGD attacks is: {:f}'.format(
         (y_eval.numpy() == y_pred_adv.detach().cpu().numpy()).astype("float").mean()))
 
     start_time = time.time()
-    aise = AISE(x_train,y_train,model=net)
+    aise = AISE(x_train,y_train,model=net,hidden_layer=HIDDEN_LAYER,avg_channel=AVG_CHANNEL)
     mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = aise(x_adv,y_eval)
     end_time = time.time()
     print("Total running time is {}".format(end_time-start_time))
@@ -371,7 +396,9 @@ if __name__ == "__main__":
     knn_acc = (knn_pred == y_eval.numpy()).astype("float").mean()
     print("The accuracy by KNN on adversarial examples is {}".format(knn_acc))
 
-    if not os.path.exists("./results"):
-        os.mkdir("./results")
-    with open("results/result_v2_{}.pkl".format(N_EVAL),"wb") as f:
-        pickle.dump([aise_pred,knn_pred,ant_logs],f)
+    if SAVE_RESULT:
+        PREFIX = "conv"+str(HIDDEN_LAYER+1) if HIDDEN_LAYER is not None else ""
+        if not os.path.exists("./results"):
+            os.mkdir("./results")
+        with open("results/result_v2_{}_{}.pkl".format(PREFIX,N_EVAL),"wb") as f:
+            pickle.dump([aise_pred,knn_pred,ant_logs],f)
