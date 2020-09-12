@@ -288,12 +288,16 @@ class AISE:
 
     @staticmethod
     def predict(*args):
+        return AISE.predict_proba(*args).argmax(axis=1)
+
+    @staticmethod
+    def predict_proba(*args,n_class):
         assert args
         if len(args) == 1:
             pla_labs = args[0]
         else:
             pla_labs = args[3]
-        return np.array(list(map(lambda x: Counter(np.array(x)).most_common(1)[0][0], pla_labs)))
+        return np.stack(list(map(lambda x: np.bincount(x,minlength=n_class)/len(x), pla_labs)))
 
     def __call__(self, ant, y_ant=None):
         return self.clonal_expansion(ant.detach(), y_ant)
@@ -308,8 +312,9 @@ if __name__ == "__main__":
 
     import argparse
     parser = argparse.ArgumentParser("AISE Launcher")
-    parser.add_argument("--train-size",help="Training size",type=int)
-    parser.add_argument("--eval-size",help="Evaluation size",type=int)
+    parser.add_argument("--class-num",help="Number of classes",type=int,default=10)
+    parser.add_argument("--train-size",help="Training size",type=int,default=2000)
+    parser.add_argument("--eval-size",help="Evaluation size",type=int,default=200)
     parser.add_argument("--hidden-layer",help="Specify a hidden layer",type=int)
     parser.add_argument("--sampling-temp",help="Sampling temperature",type=float,default=0.3)
     parser.add_argument("--avg-channel",help="Whether to average the channels or not",action="store_true")
@@ -327,8 +332,9 @@ if __name__ == "__main__":
         transforms.Normalize(mean=0.0,std=1.0)
     ])
 
-    N_TRAIN = 2000 if not args.train_size else args.train_size
-    N_EVAL = 200 if not args.eval_size else args.eval_size
+    N_CLASS = args.class_num
+    N_TRAIN = args.train_size
+    N_EVAL = args.eval_size
     HIDDEN_LAYER = args.hidden_layer
     SAMPL_TEMP = args.sampling_temp
     AVG_CHANNEL = args.avg_channel
@@ -391,7 +397,7 @@ if __name__ == "__main__":
     # this is a hook function to register in the model forward
     # register after iterative attacks
     def conv_hook(self, input, output):
-        conv_outputs.append(output.detach())
+        conv_outputs.append(F.relu(output.detach()))
         return None
 
     for layer in net.modules():
@@ -406,7 +412,8 @@ if __name__ == "__main__":
     mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = aise(x_adv,y_eval)
     end_time = time.time()
     print("Total running time is {}".format(end_time-start_time))
-    aise_pred = AISE.predict(pla_labs)
+    aise_proba = AISE.predict_proba(pla_labs,n_class=N_CLASS)
+    aise_pred = aise_proba.argmax(axis=1)
     aise_acc = (aise_pred==y_eval.numpy()).astype("float").mean()
     print("The accuracy by AISE on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,aise_acc))
 
@@ -420,12 +427,19 @@ if __name__ == "__main__":
     adv_convs = []
     adv_convs.extend(conv_outputs)
 
+    if NORMALIZE:
+        train_convs = [train_conv/train_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
+                       for train_conv in train_convs]
+        adv_convs = [adv_conv/adv_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
+                       for adv_conv in adv_convs]
+
     knn = KNeighborsClassifier(n_neighbors=5,n_jobs=-1)
     knn.fit(train_convs[HIDDEN_LAYER].detach().cpu().flatten(start_dim=1).numpy()
             if HIDDEN_LAYER is not None else x_train.flatten(start_dim=1).numpy(), y_train.numpy())
-    knn_pred = knn.predict(adv_convs[HIDDEN_LAYER].detach().cpu().flatten(
+    knn_proba = knn.predict_proba(adv_convs[HIDDEN_LAYER].detach().cpu().flatten(
         start_dim=1).numpy() if HIDDEN_LAYER is not None
                            else x_adv.flatten(start_dim=1).detach().cpu().numpy())
+    knn_pred = knn_proba.argmax(axis=1)
     knn_acc = (knn_pred == y_eval.numpy()).astype("float").mean()
     print("The accuracy by KNN on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,knn_acc))
 
@@ -433,4 +447,8 @@ if __name__ == "__main__":
         if not os.path.exists("./results"):
             os.mkdir("./results")
         with open("results/result_{}_v2_{}_{}.pkl".format(DATA_TYPE_SHORT,LAYER_NAME,N_EVAL),"wb") as f:
-            pickle.dump([aise_pred,knn_pred,ant_logs],f)
+            pickle.dump([aise_proba,knn_proba,ant_logs],f)
+    else:
+        print("The result is:")
+        print("AISE:",aise_pred,"KNN",knn_pred)
+        print(args)
