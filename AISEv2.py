@@ -120,9 +120,9 @@ class AISE:
 
         self.model.to(self.device)
         self.model.eval()
-        
+
         self.xh = self._transform_to_inner_repr(self.x_orig)
-        self.query_objects = self._build_all_query_objects()
+        self._query_objects = self._build_all_query_objects()
 
     def _build_class_query_object(self, class_label=-1):
         if class_label + 1:
@@ -150,7 +150,7 @@ class AISE:
         if self.n_class:
             print("Searching {} naive B cells per class for each of {} antigens...".format(self.n_neighbors, len(Q)),
                   end="")
-            rel_ind = [query_obj(Q) for query_obj in self.query_objects]
+            rel_ind = [query_obj(Q) for query_obj in self._query_objects]
             abs_ind = []
             for c in range(self.n_class):
                 class_ind = np.where(self.y_orig.numpy() == c)[0]
@@ -159,7 +159,7 @@ class AISE:
         else:
             print("Searching {} naive B cells for each of {} antigens...".format(self.n_neighbors, Q.size(0)),
                   end="")
-            abs_ind = [query_obj(Q) for query_obj in self.query_objects]
+            abs_ind = [query_obj(Q) for query_obj in self._query_objects]
             print('done!')
         return abs_ind
 
@@ -304,17 +304,21 @@ if __name__ == "__main__":
     from attack import *
     from mnist_model import *
     from sklearn.neighbors import KNeighborsClassifier
+    from collections import deque
 
     import argparse
     parser = argparse.ArgumentParser("AISE Launcher")
     parser.add_argument("--train-size",help="Training size",type=int)
     parser.add_argument("--eval-size",help="Evaluation size",type=int)
     parser.add_argument("--hidden-layer",help="Specify a hidden layer",type=int)
+    parser.add_argument("--sampling-temp",help="Sampling temperature",type=float,default=0.3)
+    parser.add_argument("--avg-channel",help="Whether to average the channels or not",action="store_true")
+    parser.add_argument("--device", help="CPU/GPU device")
     parser.add_argument("-c","--use-cache",help="Whether cache is used",action="store_true")
-    parser.add_argument("-a","--avg-channel",help="Whether to average the channels or not",
-                             action="store_true")
     parser.add_argument("-s","--save-result",help="Whether to save the result or not",action="store_true")
-    parser.add_argument("--device",help="CPU/GPU device")
+    parser.add_argument("-n","--normalize",help="Whether to normalize the flattened vector or not",action="store_true")
+    parser.add_argument("-a","--attack",help="Whether to use PGD attacks",action="store_true")
+
     args = parser.parse_args()
 
     ROOT = "./datasets"
@@ -326,14 +330,19 @@ if __name__ == "__main__":
     N_TRAIN = 2000 if not args.train_size else args.train_size
     N_EVAL = 200 if not args.eval_size else args.eval_size
     HIDDEN_LAYER = args.hidden_layer
+    SAMPL_TEMP = args.sampling_temp
     AVG_CHANNEL = args.avg_channel
-    USE_CACHE = args.use_cache
-    SAVE_RESULT = args.save_result
-
     if args.device:
         DEVICE = torch.device(args.device)
     else:
         DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    USE_CACHE = args.use_cache
+    SAVE_RESULT = args.save_result
+    ATTACK = args.attack
+    NORMALIZE = args.normalize
+    LAYER_NAME = "conv" + str(HIDDEN_LAYER + 1) if HIDDEN_LAYER is not None else "input"
+    DATA_TYPE = "adversarial" if ATTACK else "legitimate"
+    DATA_TYPE_SHORT = "adv" if ATTACK else "clean"
 
     net = CNN().to(DEVICE)
     net.load_state_dict(torch.load("./models/mnistmodel.pt",map_location=DEVICE)["state_dict"])
@@ -341,36 +350,34 @@ if __name__ == "__main__":
     for parameter in net.parameters():
         parameter.requires_grad_(False)
 
-    # this is a hook function to register in the model forward
-    def conv_hook(self, input, output):
-        conv_outputs.append(output.detach())
-        return None
-
-    for layer in net.modules():
-        if layer.__class__.__name__ == "Conv2d":
-            layer.register_forward_hook(conv_hook)
-
     trainset = datasets.MNIST(root=ROOT,train=True,transform=TRANSFORM,download=False)
     testset = datasets.MNIST(root=ROOT,train=False,transform=TRANSFORM,download=False)
+
     np.random.seed(1234)
-    ind_full = np.arange(len(trainset))
-    np.random.shuffle(ind_full)
-    ind_train = ind_full[:N_TRAIN]
-    ind_eval = ind_full[N_TRAIN:N_TRAIN+N_EVAL]
+    ind_train = np.arange(len(trainset))
+    np.random.shuffle(ind_train)
+    ind_train = ind_train[:N_TRAIN]
+
+    ind_eval = np.arange(len(testset))
+    np.random.shuffle(ind_eval)
+    ind_eval = ind_eval[:N_EVAL]
+
     x_train = trainset.data[ind_train].unsqueeze(1)/255.
     y_train = trainset.targets[ind_train]
-    x_eval = trainset.data[ind_eval].unsqueeze(1)/255.
-    y_eval = trainset.targets[ind_eval]
+    x_eval = testset.data[ind_eval].unsqueeze(1)/255.
+    y_eval = testset.targets[ind_eval]
 
-    conv_outputs = [] # this is a global variable!
     if USE_CACHE:
-        if os.path.exists("./cache/x_adv_v2_{}.pkl".format(N_EVAL)):
-            with open("./cache/x_adv_v2_{}.pkl".format(N_EVAL),"rb") as f:
+        if os.path.exists("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL)):
+            with open("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL),"rb") as f:
                 x_adv = torch.Tensor(pickle.load(f)).to(DEVICE)
         else:
-            x_adv = PGD(eps=40/255.,sigma=20/255.,nb_iter=20,
-                        DEVICE=DEVICE).attack(net,x_eval.to(DEVICE),y_eval.to(DEVICE)).detach().to(DEVICE)
-            with open("./cache/x_adv_v2_{}.pkl".format(N_EVAL), "wb") as f:
+            if ATTACK:
+                x_adv = PGD(eps=40/255.,sigma=20/255.,nb_iter=20,
+                            DEVICE=DEVICE).attack(net,x_eval.to(DEVICE),y_eval.to(DEVICE)).detach().to(DEVICE)
+            else:
+                x_adv = x_eval.to(DEVICE)
+            with open("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL), "wb") as f:
                 pickle.dump(x_adv.detach().cpu().numpy(), f)
     else:
         x_adv = PGD(eps=40 / 255., sigma=20 / 255., nb_iter=20,
@@ -381,24 +388,49 @@ if __name__ == "__main__":
     print('The accuracy of plain cnn under PGD attacks is: {:f}'.format(
         (y_eval.numpy() == y_pred_adv.detach().cpu().numpy()).astype("float").mean()))
 
+    # this is a hook function to register in the model forward
+    # register after iterative attacks
+    def conv_hook(self, input, output):
+        conv_outputs.append(output.detach())
+        return None
+
+    for layer in net.modules():
+        if layer.__class__.__name__ == "Conv2d":
+            layer.register_forward_hook(conv_hook)
+
+    conv_outputs = deque(maxlen=4) # this is a global variable!
+
     start_time = time.time()
-    aise = AISE(x_train,y_train,model=net,hidden_layer=HIDDEN_LAYER,avg_channel=AVG_CHANNEL)
+    aise = AISE(x_train,y_train,model=net,hidden_layer=HIDDEN_LAYER,normalize=NORMALIZE,
+                avg_channel=AVG_CHANNEL,sampling_temperature=SAMPL_TEMP)
     mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = aise(x_adv,y_eval)
     end_time = time.time()
     print("Total running time is {}".format(end_time-start_time))
     aise_pred = AISE.predict(pla_labs)
     aise_acc = (aise_pred==y_eval.numpy()).astype("float").mean()
-    print("The accuracy by AISE on adversarial examples is {}".format(aise_acc))
+    print("The accuracy by AISE on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,aise_acc))
 
-    knn = KNeighborsClassifier(n_neighbors=5)
-    knn.fit(x_train.flatten(start_dim=1).numpy(),y_train.numpy())
-    knn_pred = knn.predict(x_adv.flatten(start_dim=1).detach().cpu().numpy())
+    conv_outputs.clear() # unnecessary
+    net(x_train.to(DEVICE))
+    train_convs = []
+    train_convs.extend(conv_outputs)
+
+    conv_outputs.clear() # unnecessary
+    net(x_adv.to(DEVICE))
+    adv_convs = []
+    adv_convs.extend(conv_outputs)
+
+    knn = KNeighborsClassifier(n_neighbors=5,n_jobs=-1)
+    knn.fit(train_convs[HIDDEN_LAYER].detach().cpu().flatten(start_dim=1).numpy()
+            if HIDDEN_LAYER is not None else x_train.flatten(start_dim=1).numpy(), y_train.numpy())
+    knn_pred = knn.predict(adv_convs[HIDDEN_LAYER].detach().cpu().flatten(
+        start_dim=1).numpy() if HIDDEN_LAYER is not None
+                           else x_adv.flatten(start_dim=1).detach().cpu().numpy())
     knn_acc = (knn_pred == y_eval.numpy()).astype("float").mean()
-    print("The accuracy by KNN on adversarial examples is {}".format(knn_acc))
+    print("The accuracy by KNN on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,knn_acc))
 
     if SAVE_RESULT:
-        PREFIX = "conv"+str(HIDDEN_LAYER+1) if HIDDEN_LAYER is not None else ""
         if not os.path.exists("./results"):
             os.mkdir("./results")
-        with open("results/result_v2_{}_{}.pkl".format(PREFIX,N_EVAL),"wb") as f:
+        with open("results/result_{}_v2_{}_{}.pkl".format(DATA_TYPE_SHORT,LAYER_NAME,N_EVAL),"wb") as f:
             pickle.dump([aise_pred,knn_pred,ant_logs],f)
