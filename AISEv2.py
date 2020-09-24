@@ -73,10 +73,10 @@ class AISE:
     '''
 
     def __init__(self, x_orig, y_orig, hidden_layer=None, model=None, input_shape=None, device=torch.device("cuda"),
-                 n_class=10, n_neighbors=10, query_class="l2", norm_order=2,normalize=False,
+                 n_class=10, n_neighbors=10, query_class="l2", norm_order=2, normalize=False,
                  avg_channel=False, fitness_function=neg_l2_dist, sampling_temperature=.3,
                  max_generation=30, requires_init=False, mut_range=(.05, .15), mut_prob=(.05, .15), mut_mode="crossover",
-                 decay=(.9, .9), n_population=1000, memory_threshold=.25, plasma_threshold=.05, return_log=True):
+                 decay=(.9, .9), n_population=1000, memory_threshold=.025, plasma_threshold=.005, return_log=True):
 
         self.model = model
         self.device = device
@@ -114,34 +114,34 @@ class AISE:
         self.mut_mode = mut_mode
         self.decay = decay
         self.n_population = n_population
-        self.plasma_thres = plasma_threshold
-        self.memory_thres = memory_threshold
+        self.n_plasma = int(plasma_threshold*self.n_population)
+        self.n_memory = int(memory_threshold*self.n_population)-self.n_plasma
         self.return_log = return_log
 
         self.model.to(self.device)
         self.model.eval()
 
-        self.xh = self._transform_to_inner_repr(self.x_orig)
         self._query_objects = self._build_all_query_objects()
 
-    def _build_class_query_object(self, class_label=-1):
+    def _build_class_query_object(self, xh_orig, class_label=-1):
         if class_label + 1:
-            x_class = self.xh[self.y_orig == class_label]
+            x_class = xh_orig[self.y_orig == class_label]
         else:
-            x_class = self.xh
+            x_class = xh_orig
         if self.query_class == "l2":
-            query_object = L2NearestNeighbors(n_neighbors=self.n_neighbors).fit(x_class)
+            query_object = L2NearestNeighbors(n_neighbors=self.n_neighbors,n_jobs=-1).fit(x_class)
         return query_object
 
     def _build_all_query_objects(self):
+        xh_orig = self._hidden_repr_mapping(self.x_orig)
         if self.n_class:
             print("Building query objects for {} classes {} samples...".format(self.n_class, self.x_orig.size(0)),
                   end="")
-            query_objects = [self._build_class_query_object(i) for i in range(self.n_class)]
+            query_objects = [self._build_class_query_object(xh_orig,class_label=i) for i in range(self.n_class)]
             print("done!")
         else:
             print("Building one single query object {} samples...".format(self.x_orig.size(0)), end="")
-            query_objects = [self._build_class_query_object()]
+            query_objects = [self._build_class_query_object(xh_orig)]
             print("done!")
         return query_objects
 
@@ -163,13 +163,13 @@ class AISE:
             print('done!')
         return abs_ind
 
-    def _transform_to_inner_repr(self, x, batch_size=256):
+    def _hidden_repr_mapping(self, x, batch_size=256):
         '''
         transform b cells and antigens into inner representations of AISE
         '''
         global conv_outputs
         if self.hidden_layer is not None:
-            xs = []
+            xhs = []
             for i in range(0,x.size(0),batch_size):
                 conv_outputs.clear()
                 xx = x[i:i+batch_size]
@@ -181,17 +181,20 @@ class AISE:
                     xh = xh.flatten(start_dim=1)
                     if self.normalize:
                         xh = xh/xh.pow(2).sum(dim=1,keepdim=True).sqrt()
-                    xs.append(xh)
-            return torch.cat(xs)
+                    xhs.append(xh)
+            return torch.cat(xhs)
         else:
-            return x.flatten(start_dim=1).detach().cpu()
+            xh = x.flatten(start_dim=1)
+            if self.normalize:
+                xh = xh/xh.pow(2).sum(dim=1,keepdim=True).sqrt()
+            return xh.detach().cpu()
 
     def generate_b_cells(self, ant, ant_tran, nbc_ind, y_ant=None):
         assert ant_tran.ndim == 2, "ant: 2d tensor (n_antigens,n_features)"
-        mem_bc_batch = []
-        pla_bc_batch = []
-        mem_lab_batch = []
-        pla_lab_batch = []
+        mem_bcs = []
+        pla_bcs = []
+        mem_labs = []
+        pla_labs = []
         print("Affinity maturation process starts with population of {}...".format(self.n_population))
         ant_logs = []  # store the history dict in terms of metrics for antigens
         for n in range(ant.size(0)):
@@ -207,8 +210,8 @@ class AISE:
                 curr_gen = curr_gen.repeat((self.n_population // (self.n_class * self.n_neighbors), 1))
                 curr_gen = genadapt.mutate_random(curr_gen)  # initialize *NOTE: torch.Tensor.repeat <> numpy.repeat
                 labels = np.tile(labels, self.n_population // (self.n_class * self.n_neighbors))
-            curr_inner_repr = self._transform_to_inner_repr(curr_gen.view((-1,)+self.x_orig.size()[1:]))
-            fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_inner_repr)[0])
+            curr_repr = self._hidden_repr_mapping(curr_gen.view((-1,) + self.x_orig.size()[1:]))
+            fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_repr)[0])
             best_pop_fitness = float('-inf')
             decay_coef = (1., 1.)
             num_plateau = 0
@@ -231,10 +234,11 @@ class AISE:
                 else:
                     parents = curr_gen[parents_ind1]
                     curr_gen = genadapt(parents)
-                curr_inner_repr = self._transform_to_inner_repr(curr_gen.view((-1,)+self.x_orig.size()[1:]))
+                curr_repr = self._hidden_repr_mapping(curr_gen.view((-1,) + self.x_orig.size()[1:]))
                 labels = labels[parents_ind1]
-                fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_inner_repr)[0])
+                fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_repr)[0])
                 pop_fitness = fitness_score.sum().item()
+
                 # logging
                 fitness_pop_hist.append(pop_fitness)
                 if y_ant is not None:
@@ -242,6 +246,11 @@ class AISE:
                     fitness_true_class_hist.append(true_class_fitness)
                     true_class_pct = (labels == y_ant[n]).astype('float').mean().item()
                     pct_true_class_hist.append(true_class_pct)
+
+                # check homogeneity
+                if len(np.unique(labels)) == 1:
+                    break # early stop
+
                 # adaptive shrinkage of certain hyper-parameters
                 if self.decay:
                     assert len(self.decay) == 2
@@ -262,21 +271,19 @@ class AISE:
             if y_ant is not None:
                 ant_log["fitness_true_class"] = fitness_true_class_hist
                 ant_log["pct_true_class"] = pct_true_class_hist
-            pla_bc_batch.append(curr_gen[fitness_rank[-int(self.plasma_thres * self.n_population):]])
-            pla_lab_batch.append(labels[fitness_rank[-int(self.plasma_thres * self.n_population):]])
-            mem_bc_batch.append(curr_gen[fitness_rank[-int(self.memory_thres * self.n_population):-int(
-                self.plasma_thres * self.n_population)]])
-            mem_lab_batch.append(labels[fitness_rank[-int(self.memory_thres * self.n_population):-int(
-                self.plasma_thres * self.n_population)]])
+            pla_bcs.append(curr_gen[fitness_rank[-self.n_plasma:]])
+            pla_labs.append(labels[fitness_rank[-self.n_plasma:]])
+            mem_bcs.append(curr_gen[fitness_rank[-(self.n_memory+self.n_plasma):-self.n_plasma]])
+            mem_labs.append(labels[fitness_rank[-(self.n_memory+self.n_plasma):-self.n_plasma]])
             ant_logs.append(ant_log)
         print("Memory & plasma B cells generated!")
-        return torch.cat(mem_bc_batch), np.stack(mem_lab_batch), \
-               torch.cat(pla_bc_batch), np.stack(pla_lab_batch), \
+        return torch.stack(mem_bcs).view((-1,self.n_memory)+self.input_shape), np.stack(mem_labs), \
+               torch.stack(pla_bcs).view((-1,self.n_plasma)+self.input_shape), np.stack(pla_labs), \
                ant_logs
 
     def clonal_expansion(self, ant, y_ant=None):
         print("Clonal expansion starts...")
-        ant_tran = self._transform_to_inner_repr(ant.detach())
+        ant_tran = self._hidden_repr_mapping(ant.detach())
         nbc_ind = self._query_nns_ind(ant_tran.numpy())
         mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = self.generate_b_cells(ant.flatten(start_dim=1), ant_tran,
                                                                                nbc_ind, np.array(y_ant))
@@ -315,6 +322,7 @@ if __name__ == "__main__":
     parser.add_argument("--class-num",help="Number of classes",type=int,default=10)
     parser.add_argument("--train-size",help="Training size",type=int,default=2000)
     parser.add_argument("--eval-size",help="Evaluation size",type=int,default=200)
+    parser.add_argument("--max-generation", help="Max number of generations", type=int, default=30)
     parser.add_argument("--hidden-layer",help="Specify a hidden layer",type=int)
     parser.add_argument("--sampling-temp",help="Sampling temperature",type=float,default=0.3)
     parser.add_argument("--avg-channel",help="Whether to average the channels or not",action="store_true")
@@ -335,6 +343,7 @@ if __name__ == "__main__":
     N_CLASS = args.class_num
     N_TRAIN = args.train_size
     N_EVAL = args.eval_size
+    MAX_GEN = args.max_generation
     HIDDEN_LAYER = args.hidden_layer
     SAMPL_TEMP = args.sampling_temp
     AVG_CHANNEL = args.avg_channel
@@ -373,26 +382,32 @@ if __name__ == "__main__":
     x_eval = testset.data[ind_eval].unsqueeze(1)/255.
     y_eval = testset.targets[ind_eval]
 
-    if USE_CACHE:
-        if os.path.exists("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL)):
-            with open("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL),"rb") as f:
-                x_adv = torch.Tensor(pickle.load(f)).to(DEVICE)
-        else:
-            if ATTACK:
+    if ATTACK:
+        if USE_CACHE:
+            if os.path.exists("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL)):
+                with open("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL),"rb") as f:
+                    x_adv = torch.Tensor(pickle.load(f)).to(DEVICE)
+            else:
                 x_adv = PGD(eps=40/255.,sigma=20/255.,nb_iter=20,
                             DEVICE=DEVICE).attack(net,x_eval.to(DEVICE),y_eval.to(DEVICE)).detach().to(DEVICE)
-            else:
-                x_adv = x_eval.to(DEVICE)
-            with open("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL), "wb") as f:
-                pickle.dump(x_adv.detach().cpu().numpy(), f)
+                with open("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL), "wb") as f:
+                    pickle.dump(x_adv.detach().cpu().numpy(), f)
+        else:
+            x_adv = PGD(eps=40 / 255., sigma=20 / 255., nb_iter=20,
+                        DEVICE=DEVICE).attack(net, x_eval.to(DEVICE), y_eval.to(DEVICE)).detach().to(DEVICE)
+        x_ant = x_adv
     else:
-        x_adv = PGD(eps=40 / 255., sigma=20 / 255., nb_iter=20,
-                    DEVICE=DEVICE).attack(net, x_eval.to(DEVICE), y_eval.to(DEVICE)).detach().to(DEVICE)
+        x_ant = x_eval.to(DEVICE)
 
-    *_, out = net(x_adv)
-    y_pred_adv = torch.max(out, 1)[1]
-    print('The accuracy of plain cnn under PGD attacks is: {:f}'.format(
-        (y_eval.numpy() == y_pred_adv.detach().cpu().numpy()).astype("float").mean()))
+    *_, out = net(x_ant)
+    y_pred = torch.max(out, 1)[1]
+
+    if ATTACK:
+        print('The accuracy of plain cnn under PGD attacks is: {}'.format(
+            (y_eval.numpy() == y_pred.detach().cpu().numpy()).astype("float").mean()))
+    else:
+        print("The accuracy of plain cnn on clean data is: {}".format(
+            (y_eval.numpy() == y_pred.detach().cpu().numpy()).astype("float").mean()))
 
     # this is a hook function to register in the model forward
     # register after iterative attacks
@@ -408,8 +423,8 @@ if __name__ == "__main__":
 
     start_time = time.time()
     aise = AISE(x_train,y_train,model=net,hidden_layer=HIDDEN_LAYER,normalize=NORMALIZE,
-                avg_channel=AVG_CHANNEL,sampling_temperature=SAMPL_TEMP)
-    mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = aise(x_adv,y_eval)
+                avg_channel=AVG_CHANNEL,sampling_temperature=SAMPL_TEMP,max_generation=MAX_GEN)
+    mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = aise(x_ant,y_eval)
     end_time = time.time()
     print("Total running time is {}".format(end_time-start_time))
     aise_proba = AISE.predict_proba(pla_labs,n_class=N_CLASS)
@@ -423,22 +438,22 @@ if __name__ == "__main__":
     train_convs.extend(conv_outputs)
 
     conv_outputs.clear() # unnecessary
-    net(x_adv.to(DEVICE))
-    adv_convs = []
-    adv_convs.extend(conv_outputs)
+    net(x_ant.to(DEVICE))
+    ant_convs = []
+    ant_convs.extend(conv_outputs)
 
     if NORMALIZE:
-        train_convs = [train_conv/train_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
-                       for train_conv in train_convs]
-        adv_convs = [adv_conv/adv_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
-                       for adv_conv in adv_convs]
+        x_train.div_(x_train.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
+        train_convs = [train_conv/train_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt() for train_conv in train_convs]
+        x_ant.div_(x_ant.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
+        ant_convs = [ant_conv/ant_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt() for ant_conv in ant_convs]
 
     knn = KNeighborsClassifier(n_neighbors=5,n_jobs=-1)
     knn.fit(train_convs[HIDDEN_LAYER].detach().cpu().flatten(start_dim=1).numpy()
             if HIDDEN_LAYER is not None else x_train.flatten(start_dim=1).numpy(), y_train.numpy())
-    knn_proba = knn.predict_proba(adv_convs[HIDDEN_LAYER].detach().cpu().flatten(
+    knn_proba = knn.predict_proba(ant_convs[HIDDEN_LAYER].detach().cpu().flatten(
         start_dim=1).numpy() if HIDDEN_LAYER is not None
-                           else x_adv.flatten(start_dim=1).detach().cpu().numpy())
+                           else x_ant.flatten(start_dim=1).detach().cpu().numpy())
     knn_pred = knn_proba.argmax(axis=1)
     knn_acc = (knn_pred == y_eval.numpy()).astype("float").mean()
     print("The accuracy by KNN on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,knn_acc))
@@ -446,8 +461,10 @@ if __name__ == "__main__":
     if SAVE_RESULT:
         if not os.path.exists("./results"):
             os.mkdir("./results")
-        with open("results/result_{}_v2_{}_{}.pkl".format(DATA_TYPE_SHORT,LAYER_NAME,N_EVAL),"wb") as f:
+        with open("results/result_v2_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,LAYER_NAME,N_EVAL),"wb") as f:
             pickle.dump([aise_proba,knn_proba,ant_logs],f)
+        with open("results/bcells_v2_{}_{}_{}.pkl".format(DATA_TYPE_SHORT, LAYER_NAME, N_EVAL), "wb") as f:
+            pickle.dump([mem_bcs.detach().cpu().numpy(),pla_bcs.detach().cpu().numpy()],f)
     else:
         print("The result is:")
         print("AISE:",aise_pred,"KNN",knn_pred)
