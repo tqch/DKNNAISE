@@ -99,6 +99,7 @@ class AISE:
         self.avg_channel = avg_channel
         self.fitness_func = fitness_function
         self.sampl_temp = sampling_temperature
+
         self.max_generation = max_generation
         self.n_population = self.n_class * self.n_neighbors
         self.requires_init = requires_init
@@ -202,7 +203,6 @@ class AISE:
             genadapt = GenAdapt(self.mut_range[1], self.mut_prob[1], mode=self.mut_mode)
             curr_gen = torch.cat([self.x_orig[ind[n]].flatten(start_dim=1) for ind in nbc_ind])  # naive b cells
             labels = np.concatenate([self.y_orig[ind[n]] for ind in nbc_ind])
-            static_index = np.arange(len(labels))
             if self.requires_init:
                 assert self.n_population % (
                         self.n_class * self.n_neighbors) == 0, \
@@ -210,16 +210,26 @@ class AISE:
                 curr_gen = curr_gen.repeat((self.n_population // (self.n_class * self.n_neighbors), 1))
                 curr_gen = genadapt.mutate_random(curr_gen)  # initialize *NOTE: torch.Tensor.repeat <> numpy.repeat
                 labels = np.tile(labels, self.n_population // (self.n_class * self.n_neighbors))
+
+            static_index = np.arange(len(self.max_generation))  # static generation indices
             curr_repr = self._hidden_repr_mapping(curr_gen.view((-1,) + self.x_orig.size()[1:]))
             fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_repr)[0])
             best_pop_fitness = float('-inf')
             decay_coef = (1., 1.)
             num_plateau = 0
             ant_log = dict()  # history log for each antigen
+            # zeroth generation logging
             fitness_pop_hist = []
+            pop_fitness = fitness_score.sum().item()
+            fitness_pop_hist.append(pop_fitness)
             if y_ant is not None:
                 fitness_true_class_hist = []
                 pct_true_class_hist = []
+                true_class_fitness = fitness_score[labels == y_ant[n]].sum().item()
+                fitness_true_class_hist.append(true_class_fitness)
+                true_class_pct = (labels == y_ant[n]).astype('float').mean().item()
+                pct_true_class_hist.append(true_class_pct)
+
             for i in range(self.max_generation):
                 survival_prob = F.softmax(fitness_score / self.sampl_temp, dim=-1)
                 parents_ind1 = np.array(Categorical(probs=survival_prob).sample((self.n_population,)))
@@ -227,7 +237,6 @@ class AISE:
                     parents_ind2 = np.concatenate([Categorical(probs=F.softmax(fitness_score[labels==labels[ind]] / self.sampl_temp,
                                                           dim=-1)).sample((1,)) for ind in parents_ind1])
                     parents_ind2 = [static_index[labels==labels[ind1]][ind2] for ind1,ind2 in zip(parents_ind1,parents_ind2)]
-                    static_index = np.arange(self.n_population)
                     parents = [curr_gen[parents_ind1],curr_gen[parents_ind2]]
                     curr_gen = genadapt(parents, fitness_score[parents_ind1] /\
                                       (fitness_score[parents_ind1]+fitness_score[parents_ind2]))
@@ -311,6 +320,7 @@ class AISE:
 
 if __name__ == "__main__":
     import os,time,pickle
+    from datetime import datetime
     from torchvision import transforms, datasets
     from attack import *
     from mnist_model import *
@@ -322,7 +332,8 @@ if __name__ == "__main__":
     parser.add_argument("--class-num",help="Number of classes",type=int,default=10)
     parser.add_argument("--train-size",help="Training size",type=int,default=2000)
     parser.add_argument("--eval-size",help="Evaluation size",type=int,default=200)
-    parser.add_argument("--max-generation", help="Max number of generations", type=int, default=30)
+    parser.add_argument("--n-neighbors",help="Number of ancestors for each class",type=int,default=10)
+    parser.add_argument("--max-generation",help="Max number of generations",type=int,default=50)
     parser.add_argument("--hidden-layer",help="Specify a hidden layer",type=int)
     parser.add_argument("--sampling-temp",help="Sampling temperature",type=float,default=0.3)
     parser.add_argument("--avg-channel",help="Whether to average the channels or not",action="store_true")
@@ -343,6 +354,7 @@ if __name__ == "__main__":
     N_CLASS = args.class_num
     N_TRAIN = args.train_size
     N_EVAL = args.eval_size
+    N_NEIGH = args.n_neighbors
     MAX_GEN = args.max_generation
     HIDDEN_LAYER = args.hidden_layer
     SAMPL_TEMP = args.sampling_temp
@@ -384,16 +396,16 @@ if __name__ == "__main__":
 
     if ATTACK:
         if USE_CACHE:
-            if os.path.exists("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL)):
-                with open("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL),"rb") as f:
+            if os.path.exists("./cache/x_v2_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL)):
+                with open("./cache/x_v2_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL),"rb") as f:
                     x_adv = torch.Tensor(pickle.load(f)).to(DEVICE)
             else:
                 x_adv = PGD(eps=40/255.,sigma=20/255.,nb_iter=20,
                             DEVICE=DEVICE).attack(net,x_eval.to(DEVICE),y_eval.to(DEVICE)).detach().to(DEVICE)
-                with open("./cache/x_{}_v2_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL), "wb") as f:
+                with open("./cache/x_v2_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL), "wb") as f:
                     pickle.dump(x_adv.detach().cpu().numpy(), f)
         else:
-            x_adv = PGD(eps=40 / 255., sigma=20 / 255., nb_iter=20,
+            x_adv = PGD(eps=40/255., sigma=20/255., nb_iter=20,
                         DEVICE=DEVICE).attack(net, x_eval.to(DEVICE), y_eval.to(DEVICE)).detach().to(DEVICE)
         x_ant = x_adv
     else:
@@ -422,8 +434,8 @@ if __name__ == "__main__":
     conv_outputs = deque(maxlen=4) # this is a global variable!
 
     start_time = time.time()
-    aise = AISE(x_train,y_train,model=net,hidden_layer=HIDDEN_LAYER,normalize=NORMALIZE,
-                avg_channel=AVG_CHANNEL,sampling_temperature=SAMPL_TEMP,max_generation=MAX_GEN)
+    aise = AISE(x_train,y_train,model=net,n_neighbors=N_NEIGH,hidden_layer=HIDDEN_LAYER,max_generation=MAX_GEN,normalize=NORMALIZE,
+                avg_channel=AVG_CHANNEL,sampling_temperature=SAMPL_TEMP)
     mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = aise(x_ant,y_eval)
     end_time = time.time()
     print("Total running time is {}".format(end_time-start_time))
@@ -459,11 +471,12 @@ if __name__ == "__main__":
     print("The accuracy by KNN on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,knn_acc))
 
     if SAVE_RESULT:
+        timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d%H%M%S")
         if not os.path.exists("./results"):
             os.mkdir("./results")
-        with open("results/result_v2_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,LAYER_NAME,N_EVAL),"wb") as f:
+        with open("results/result_v2_{}_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,LAYER_NAME,N_EVAL,timestamp),"wb") as f:
             pickle.dump([aise_proba,knn_proba,ant_logs],f)
-        with open("results/bcells_v2_{}_{}_{}.pkl".format(DATA_TYPE_SHORT, LAYER_NAME, N_EVAL), "wb") as f:
+        with open("results/bcells_v2_{}_{}_{}_{}.pkl".format(DATA_TYPE_SHORT, LAYER_NAME, N_EVAL,timestamp), "wb") as f:
             pickle.dump([mem_bcs.detach().cpu().numpy(),pla_bcs.detach().cpu().numpy()],f)
     else:
         print("The result is:")
