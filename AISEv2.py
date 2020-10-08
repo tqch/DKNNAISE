@@ -2,8 +2,6 @@ import torch
 import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics.pairwise import euclidean_distances
-from sklearn.preprocessing import normalize
 import numpy as np
 import math,time
 from collections import Counter
@@ -20,13 +18,13 @@ class GenAdapt:
 
     def crossover(self, base1, base2, select_prob):
         assert base1.ndim == 2 and base2.ndim == 2, "Number of dimensions should be 2"
-        crossover_mask = torch.rand(base1.size()) < torch.Tensor(select_prob[:,None])
+        crossover_mask = torch.rand_like(base1) < select_prob[:,None]
         return torch.where(crossover_mask, base1, base2)
 
     def mutate_random(self, base):
         mut = 2 * torch.rand_like(base) - 1  # uniform (-1,1)
         mut = self.mut_range * mut
-        mut_mask = torch.rand(base.size()) < self.mut_prob
+        mut_mask = torch.rand_like(base) < self.mut_prob
         child = torch.where(mut_mask, base, base + mut)
         return torch.clamp(child, 0, 1)
 
@@ -56,16 +54,15 @@ class L2NearestNeighbors(NearestNeighbors):
     def __call__(self, X):
         return self.kneighbors(X, return_distance=False)
 
-def neg_l2_dist(X, Y):
-    return -euclidean_distances(X, Y)
+def neg_l2_dist(x,y):
+    '''
+    x: (1,n_feature)
+    y: (N,n_feature)
+    '''
+    return -(x-y).pow(2).sum(dim=1).sqrt()
 
-def cosine_similarity(X, Y, normalized = False):
-    if not normalized:
-        X_nm = normalize(X, axis=1)
-        Y_nm = normalize(X, axis=1)
-    else:
-        X_nm,Y_nm = X,Y
-    return 1-.5*euclidean_distances(X_nm,Y_nm)
+def inner_product(X, Y):
+    return (X@Y.T)[0]
 
 class AISE:
     '''
@@ -74,9 +71,11 @@ class AISE:
 
     def __init__(self, x_orig, y_orig, hidden_layer=None, model=None, input_shape=None, device=torch.device("cuda"),
                  n_class=10, n_neighbors=10, query_class="l2", norm_order=2, normalize=False,
-                 avg_channel=False, fitness_function=neg_l2_dist, sampling_temperature=.3,
-                 max_generation=30, requires_init=False, mut_range=(.05, .15), mut_prob=(.05, .15), mut_mode="crossover",
-                 decay=(.9, .9), n_population=1000, memory_threshold=.025, plasma_threshold=.005, return_log=True):
+                 avg_channel=False, fitness_function="negative l2", sampling_temperature=.3, adaptive_temp=False,
+                 max_generation=50, requires_init=True, apply_bound=False,
+                 mut_range=(.05, .15), mut_prob=(.05, .15), mut_mode="crossover",
+                 decay=(.9, .9), n_population=1000, memory_threshold=.25, plasma_threshold=.05,
+                 keep_memory=False, return_log=True):
 
         self.model = model
         self.device = device
@@ -97,12 +96,14 @@ class AISE:
         self.norm_order = norm_order
         self.normalize = normalize
         self.avg_channel = avg_channel
-        self.fitness_func = fitness_function
+        self.fitness_func = self._get_fitness_func(fitness_function)
         self.sampl_temp = sampling_temperature
+        self.adaptive_temp = adaptive_temp
 
         self.max_generation = max_generation
         self.n_population = self.n_class * self.n_neighbors
         self.requires_init = requires_init
+        self.apply_bound = apply_bound
 
         self.mut_range = mut_range
         self.mut_prob = mut_prob
@@ -117,12 +118,22 @@ class AISE:
         self.n_population = n_population
         self.n_plasma = int(plasma_threshold*self.n_population)
         self.n_memory = int(memory_threshold*self.n_population)-self.n_plasma
+
+        self.keep_memory = keep_memory
         self.return_log = return_log
 
         self.model.to(self.device)
         self.model.eval()
 
         self._query_objects = self._build_all_query_objects()
+
+    def _get_fitness_func(self,func_str):
+        if func_str == "negative l2":
+            return neg_l2_dist
+        elif func_str == "inner product":
+            return inner_product
+        else:
+            raise ValueError("Unsupported fitness function type!")
 
     def _build_class_query_object(self, xh_orig, class_label=-1):
         if class_label + 1:
@@ -134,7 +145,9 @@ class AISE:
         return query_object
 
     def _build_all_query_objects(self):
-        xh_orig = self._hidden_repr_mapping(self.x_orig)
+        xh_orig = self._hidden_repr_mapping(self.x_orig,query=True).detach().cpu().numpy()
+        if self.adaptive_temp:
+            self.sampl_temp *= np.sqrt(xh_orig.shape[1]/np.prod(self.input_shape)).item()  # heuristic sampling temperature: proportion to the square root of feature space dimension
         if self.n_class:
             print("Building query objects for {} classes {} samples...".format(self.n_class, self.x_orig.size(0)),
                   end="")
@@ -164,45 +177,61 @@ class AISE:
             print('done!')
         return abs_ind
 
-    def _hidden_repr_mapping(self, x, batch_size=256):
+    def _hidden_repr_mapping(self, x, batch_size=512, query=False):
         '''
         transform b cells and antigens into inner representations of AISE
         '''
-        global conv_outputs
         if self.hidden_layer is not None:
             xhs = []
             for i in range(0,x.size(0),batch_size):
-                conv_outputs.clear()
                 xx = x[i:i+batch_size]
                 with torch.no_grad():
-                    self.model(xx.to(self.device))
-                    xh = conv_outputs[self.hidden_layer].detach().cpu()
+                    *hidden_out, _ = self.model(xx.to(self.device))
+                    if query:
+                        xh = hidden_out[self.hidden_layer].detach().cpu()
+                    else:
+                        xh = hidden_out[self.hidden_layer]
                     if self.avg_channel:
                         xh = xh.sum(dim=1)
                     xh = xh.flatten(start_dim=1)
                     if self.normalize:
                         xh = xh/xh.pow(2).sum(dim=1,keepdim=True).sqrt()
-                    xhs.append(xh)
+                    xhs.append(xh.detach())
             return torch.cat(xhs)
         else:
             xh = x.flatten(start_dim=1)
             if self.normalize:
                 xh = xh/xh.pow(2).sum(dim=1,keepdim=True).sqrt()
-            return xh.detach().cpu()
+            return xh.detach()
+
+    def clip_class_bound(self,x,y,class_center,class_bound):
+        return torch.min(torch.max(x,(class_center-class_bound)[y]),(class_center+class_bound)[y])
 
     def generate_b_cells(self, ant, ant_tran, nbc_ind, y_ant=None):
         assert ant_tran.ndim == 2, "ant: 2d tensor (n_antigens,n_features)"
-        mem_bcs = []
         pla_bcs = []
-        mem_labs = []
         pla_labs = []
+        if self.keep_memory:
+            mem_bcs = []
+            mem_labs = []
+        else:
+            mem_bcs = None
+            mem_labs = None
         print("Affinity maturation process starts with population of {}...".format(self.n_population))
         ant_logs = []  # store the history dict in terms of metrics for antigens
         for n in range(ant.size(0)):
             # print(torch.cuda.memory_summary())
             genadapt = GenAdapt(self.mut_range[1], self.mut_prob[1], mode=self.mut_mode)
-            curr_gen = torch.cat([self.x_orig[ind[n]].flatten(start_dim=1) for ind in nbc_ind])  # naive b cells
+            curr_gen = torch.cat([self.x_orig[ind[n]].flatten(start_dim=1) for ind in nbc_ind]).to(self.device)  # naive b cells
             labels = np.concatenate([self.y_orig[ind[n]] for ind in nbc_ind])
+            if self.apply_bound:
+                class_center = []
+                class_bound = []
+                for i in range(0,len(curr_gen),self.n_neighbors):
+                    class_center.append(torch.mean(curr_gen[i:i+self.n_neighbors],dim=0))
+                    class_bound.append((curr_gen[i:i+self.n_neighbors]-class_center[-1]).abs().max(dim=0)[0])
+                class_center = torch.stack(class_center)
+                class_bound = torch.stack(class_bound)
             if self.requires_init:
                 assert self.n_population % (
                         self.n_class * self.n_neighbors) == 0, \
@@ -210,10 +239,11 @@ class AISE:
                 curr_gen = curr_gen.repeat((self.n_population // (self.n_class * self.n_neighbors), 1))
                 curr_gen = genadapt.mutate_random(curr_gen)  # initialize *NOTE: torch.Tensor.repeat <> numpy.repeat
                 labels = np.tile(labels, self.n_population // (self.n_class * self.n_neighbors))
+                if self.apply_bound:
+                    curr_gen = self.clip_class_bound(curr_gen,labels,class_center,class_bound)
 
-            static_index = np.arange(len(self.max_generation))  # static generation indices
             curr_repr = self._hidden_repr_mapping(curr_gen.view((-1,) + self.x_orig.size()[1:]))
-            fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_repr)[0])
+            fitness_score = self.fitness_func(ant_tran[n].unsqueeze(0).to(self.device), curr_repr.to(self.device))
             best_pop_fitness = float('-inf')
             decay_coef = (1., 1.)
             num_plateau = 0
@@ -230,22 +260,28 @@ class AISE:
                 true_class_pct = (labels == y_ant[n]).astype('float').mean().item()
                 pct_true_class_hist.append(true_class_pct)
 
+            static_index = torch.LongTensor(torch.arange(len(labels))).to(self.device)  # static generation indices
             for i in range(self.max_generation):
-                survival_prob = F.softmax(fitness_score / self.sampl_temp, dim=-1)
-                parents_ind1 = np.array(Categorical(probs=survival_prob).sample((self.n_population,)))
+                select_prob = F.softmax(fitness_score / self.sampl_temp, dim=-1)
+                parents_ind1 = Categorical(probs=select_prob).sample((self.n_population,))
                 if self.mut_mode == "crossover":
-                    parents_ind2 = np.concatenate([Categorical(probs=F.softmax(fitness_score[labels==labels[ind]] / self.sampl_temp,
-                                                          dim=-1)).sample((1,)) for ind in parents_ind1])
-                    parents_ind2 = [static_index[labels==labels[ind1]][ind2] for ind1,ind2 in zip(parents_ind1,parents_ind2)]
-                    parents = [curr_gen[parents_ind1],curr_gen[parents_ind2]]
-                    curr_gen = genadapt(parents, fitness_score[parents_ind1] /\
-                                      (fitness_score[parents_ind1]+fitness_score[parents_ind2]))
+                    parents_ind2 = torch.zeros_like(parents_ind1)
+                    for c in range(self.n_class):
+                        pos = static_index[labels[parents_ind1.cpu()]==c]
+                        if len(pos):
+                            parents_ind2_class = Categorical(probs=F.softmax(fitness_score[static_index[labels==c]] / self.sampl_temp,dim=-1)).sample((len(pos),))
+                            parents_ind2[pos] = static_index[labels==c][parents_ind2_class.cpu()]
+                    parent_pairs = [curr_gen[parents_ind1],curr_gen[parents_ind2]]
+                    curr_gen = genadapt(parent_pairs, fitness_score[parents_ind1] / \
+                                        (fitness_score[parents_ind1] + fitness_score[parents_ind2]))
                 else:
                     parents = curr_gen[parents_ind1]
                     curr_gen = genadapt(parents)
                 curr_repr = self._hidden_repr_mapping(curr_gen.view((-1,) + self.x_orig.size()[1:]))
-                labels = labels[parents_ind1]
-                fitness_score = torch.Tensor(self.fitness_func(ant_tran[n].unsqueeze(0), curr_repr)[0])
+                labels = labels[parents_ind1.cpu()]
+                if self.apply_bound:
+                    curr_gen = self.clip_class_bound(curr_gen,labels,class_center,class_bound)
+                fitness_score = self.fitness_func(ant_tran[n].unsqueeze(0).to(self.device), curr_repr.to(self.device))
                 pop_fitness = fitness_score.sum().item()
 
                 # logging
@@ -275,45 +311,48 @@ class AISE:
                                             mode=self.mut_mode)
                     else:
                         best_pop_fitness = pop_fitness
-            _, fitness_rank = torch.sort(fitness_score)
+            _, fitness_rank = torch.sort(fitness_score.cpu())
             ant_log["fitness_pop"] = fitness_pop_hist
             if y_ant is not None:
                 ant_log["fitness_true_class"] = fitness_true_class_hist
                 ant_log["pct_true_class"] = pct_true_class_hist
-            pla_bcs.append(curr_gen[fitness_rank[-self.n_plasma:]])
+            pla_bcs.append(curr_gen[fitness_rank[-self.n_plasma:]].detach().cpu())
             pla_labs.append(labels[fitness_rank[-self.n_plasma:]])
-            mem_bcs.append(curr_gen[fitness_rank[-(self.n_memory+self.n_plasma):-self.n_plasma]])
-            mem_labs.append(labels[fitness_rank[-(self.n_memory+self.n_plasma):-self.n_plasma]])
+            if self.keep_memory:
+                mem_bcs.append(curr_gen[fitness_rank[-(self.n_memory+self.n_plasma):-self.n_plasma]].detach().cpu())
+                mem_labs.append(labels[fitness_rank[-(self.n_memory+self.n_plasma):-self.n_plasma]])
             ant_logs.append(ant_log)
-        print("Memory & plasma B cells generated!")
-        return torch.stack(mem_bcs).view((-1,self.n_memory)+self.input_shape), np.stack(mem_labs), \
-               torch.stack(pla_bcs).view((-1,self.n_plasma)+self.input_shape), np.stack(pla_labs), \
-               ant_logs
+
+        pla_bcs = torch.stack(pla_bcs).view((-1,self.n_plasma)+self.input_shape).numpy()
+        pla_labs = np.stack(pla_labs)
+        if self.keep_memory:
+            mem_bcs = torch.stack(mem_bcs).view((-1,self.n_mem)+self.input_shape).numpy()
+            mem_labs = np.stack(mem_labs)
+
+        return mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs
 
     def clonal_expansion(self, ant, y_ant=None):
         print("Clonal expansion starts...")
         ant_tran = self._hidden_repr_mapping(ant.detach())
-        nbc_ind = self._query_nns_ind(ant_tran.numpy())
+        nbc_ind = self._query_nns_ind(ant_tran.detach().cpu().numpy())
         mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = self.generate_b_cells(ant.flatten(start_dim=1), ant_tran,
                                                                                nbc_ind, np.array(y_ant))
-        print("{} plasma B cells and {} memory generated!".format(pla_bcs.size(0), mem_bcs.size(0)))
+        if self.keep_memory:
+            print("{} plasma B cells and {} memory generated!".format(pla_bcs.shape[0]*self.n_plasma, mem_bcs.shape[0]*self.n_memory))
+        else:
+            print("{} plasma B cells generated!".format(pla_bcs.shape[0]*self.n_plasma))
         if self.return_log:
             return mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs
         else:
             return mem_bcs, mem_labs, pla_bcs, pla_labs
 
     @staticmethod
-    def predict(*args):
-        return AISE.predict_proba(*args).argmax(axis=1)
+    def predict(labs):
+        return AISE.predict_proba(labs).argmax(axis=1)
 
     @staticmethod
-    def predict_proba(*args,n_class):
-        assert args
-        if len(args) == 1:
-            pla_labs = args[0]
-        else:
-            pla_labs = args[3]
-        return np.stack(list(map(lambda x: np.bincount(x,minlength=n_class)/len(x), pla_labs)))
+    def predict_proba(labs,n_class):
+        return np.stack(list(map(lambda x: np.bincount(x,minlength=n_class)/len(x), labs)))
 
     def __call__(self, ant, y_ant=None):
         return self.clonal_expansion(ant.detach(), y_ant)
@@ -335,20 +374,26 @@ if __name__ == "__main__":
     parser.add_argument("--n-neighbors",help="Number of ancestors for each class",type=int,default=10)
     parser.add_argument("--max-generation",help="Max number of generations",type=int,default=50)
     parser.add_argument("--hidden-layer",help="Specify a hidden layer",type=int)
+    parser.add_argument("--fitness-function",help="Specify a function used to calculate fitness score",default="negative l2")
     parser.add_argument("--sampling-temp",help="Sampling temperature",type=float,default=0.3)
     parser.add_argument("--avg-channel",help="Whether to average the channels or not",action="store_true")
     parser.add_argument("--device", help="CPU/GPU device")
+    parser.add_argument("--no-knn", help="Whether to skip knn or not",action="store_true")
+    parser.add_argument("--attack-intensity", help="The radius of lp ball constraint on attacks (0-255)",type=int,default=40)
     parser.add_argument("-c","--use-cache",help="Whether cache is used",action="store_true")
     parser.add_argument("-s","--save-result",help="Whether to save the result or not",action="store_true")
     parser.add_argument("-n","--normalize",help="Whether to normalize the flattened vector or not",action="store_true")
     parser.add_argument("-a","--attack",help="Whether to use PGD attacks",action="store_true")
+    parser.add_argument("-b","--apply-bound",help="Whether to clip according to class bound",action="store_true")
+    parser.add_argument("-t","--adaptive-temp",help="Whether to use heuristic sampling temperature or not",action="store_true")
+    parser.add_argument("-k","--keep-memory",help="Whether to keep memory data or not",action="store_true")
 
     args = parser.parse_args()
 
     ROOT = "./datasets"
     TRANSFORM = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=0.0,std=1.0)
+        transforms.Normalize(mean=(0.0,),std=(1.0,))
     ])
 
     N_CLASS = args.class_num
@@ -356,7 +401,10 @@ if __name__ == "__main__":
     N_EVAL = args.eval_size
     N_NEIGH = args.n_neighbors
     MAX_GEN = args.max_generation
+    APPLY_BOUND = args.apply_bound
+    ADAPTIVE_TEMP = args.adaptive_temp
     HIDDEN_LAYER = args.hidden_layer
+    FITNESS_FUNC = args.fitness_function
     SAMPL_TEMP = args.sampling_temp
     AVG_CHANNEL = args.avg_channel
     if args.device:
@@ -367,11 +415,15 @@ if __name__ == "__main__":
     SAVE_RESULT = args.save_result
     ATTACK = args.attack
     NORMALIZE = args.normalize
+    KEEP_MEMORY = args.keep_memory
+    NO_KNN = args.no_knn
+    EPS = args.attack_intensity
+
     LAYER_NAME = "conv" + str(HIDDEN_LAYER + 1) if HIDDEN_LAYER is not None else "input"
     DATA_TYPE = "adversarial" if ATTACK else "legitimate"
     DATA_TYPE_SHORT = "adv" if ATTACK else "clean"
 
-    net = CNN().to(DEVICE)
+    net = CNN()
     net.load_state_dict(torch.load("./models/mnistmodel.pt",map_location=DEVICE)["state_dict"])
     net.eval()
     for parameter in net.parameters():
@@ -394,24 +446,41 @@ if __name__ == "__main__":
     x_eval = testset.data[ind_eval].unsqueeze(1)/255.
     y_eval = testset.targets[ind_eval]
 
+    net.to(DEVICE)
     if ATTACK:
         if USE_CACHE:
-            if os.path.exists("./cache/x_v2_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL)):
-                with open("./cache/x_v2_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL),"rb") as f:
+            if os.path.exists("./cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS)):
+                with open("./cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS),"rb") as f:
                     x_adv = torch.Tensor(pickle.load(f)).to(DEVICE)
             else:
-                x_adv = PGD(eps=40/255.,sigma=20/255.,nb_iter=20,
-                            DEVICE=DEVICE).attack(net,x_eval.to(DEVICE),y_eval.to(DEVICE)).detach().to(DEVICE)
-                with open("./cache/x_v2_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL), "wb") as f:
+                x_adv = PGD(eps=EPS/255.,sigma=20/255.,nb_iter=20,
+                            DEVICE=DEVICE).attack_batch(net,x_eval.to(DEVICE),y_eval.to(DEVICE))
+                with open("./cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS), "wb") as f:
                     pickle.dump(x_adv.detach().cpu().numpy(), f)
         else:
-            x_adv = PGD(eps=40/255., sigma=20/255., nb_iter=20,
-                        DEVICE=DEVICE).attack(net, x_eval.to(DEVICE), y_eval.to(DEVICE)).detach().to(DEVICE)
+            x_adv = PGD(eps=EPS/255., sigma=20 / 255., nb_iter=20,
+                        DEVICE=DEVICE).attack_batch(net, x_eval.to(DEVICE), y_eval.to(DEVICE))
         x_ant = x_adv
     else:
         x_ant = x_eval.to(DEVICE)
 
-    *_, out = net(x_ant)
+    def feature_extractor(net,x,hidden_layer=-1,batch_size=2048,device=DEVICE):
+        if hidden_layer == -1:  # return the last output of net
+            outs = []
+            for i in range(0,x.size(0),batch_size):
+                xx = x[i:i+batch_size]
+                *_, out = net(xx.to(device))
+                outs.append(out.detach().cpu())
+            return torch.cat(outs,dim=0)
+        else:
+            out_hiddens = []
+            for i in range(0,x.size(0),batch_size):
+                xx = x[i:i+batch_size]
+                *out_hidden,_ = [h.detach().cpu() for h in net(xx.to(device))]
+                out_hiddens.append(out_hidden[hidden_layer])
+            return torch.cat(out_hiddens,dim=0)
+
+    out = feature_extractor(net,x_ant)
     y_pred = torch.max(out, 1)[1]
 
     if ATTACK:
@@ -421,21 +490,10 @@ if __name__ == "__main__":
         print("The accuracy of plain cnn on clean data is: {}".format(
             (y_eval.numpy() == y_pred.detach().cpu().numpy()).astype("float").mean()))
 
-    # this is a hook function to register in the model forward
-    # register after iterative attacks
-    def conv_hook(self, input, output):
-        conv_outputs.append(F.relu(output.detach()))
-        return None
-
-    for layer in net.modules():
-        if layer.__class__.__name__ == "Conv2d":
-            layer.register_forward_hook(conv_hook)
-
-    conv_outputs = deque(maxlen=4) # this is a global variable!
-
     start_time = time.time()
     aise = AISE(x_train,y_train,model=net,n_neighbors=N_NEIGH,hidden_layer=HIDDEN_LAYER,max_generation=MAX_GEN,normalize=NORMALIZE,
-                avg_channel=AVG_CHANNEL,sampling_temperature=SAMPL_TEMP)
+                avg_channel=AVG_CHANNEL,fitness_function=FITNESS_FUNC,sampling_temperature=SAMPL_TEMP,adaptive_temp=ADAPTIVE_TEMP,
+                apply_bound=APPLY_BOUND,keep_memory=KEEP_MEMORY)
     mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = aise(x_ant,y_eval)
     end_time = time.time()
     print("Total running time is {}".format(end_time-start_time))
@@ -444,40 +502,38 @@ if __name__ == "__main__":
     aise_acc = (aise_pred==y_eval.numpy()).astype("float").mean()
     print("The accuracy by AISE on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,aise_acc))
 
-    conv_outputs.clear() # unnecessary
-    net(x_train.to(DEVICE))
-    train_convs = []
-    train_convs.extend(conv_outputs)
+    if NO_KNN:
+        knn_proba = None
+    else:
+        if HIDDEN_LAYER is not None:
+            train_conv = feature_extractor(net,x_train,HIDDEN_LAYER)
+            ant_conv = feature_extractor(net,x_ant,HIDDEN_LAYER)
 
-    conv_outputs.clear() # unnecessary
-    net(x_ant.to(DEVICE))
-    ant_convs = []
-    ant_convs.extend(conv_outputs)
+        if NORMALIZE:
+            x_train.div_(x_train.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
+            x_ant.div_(x_ant.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
+            if HIDDEN_LAYER is not None:
+                train_conv = train_conv/train_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
+                ant_conv = ant_conv/ant_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
 
-    if NORMALIZE:
-        x_train.div_(x_train.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
-        train_convs = [train_conv/train_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt() for train_conv in train_convs]
-        x_ant.div_(x_ant.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
-        ant_convs = [ant_conv/ant_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt() for ant_conv in ant_convs]
 
-    knn = KNeighborsClassifier(n_neighbors=5,n_jobs=-1)
-    knn.fit(train_convs[HIDDEN_LAYER].detach().cpu().flatten(start_dim=1).numpy()
-            if HIDDEN_LAYER is not None else x_train.flatten(start_dim=1).numpy(), y_train.numpy())
-    knn_proba = knn.predict_proba(ant_convs[HIDDEN_LAYER].detach().cpu().flatten(
-        start_dim=1).numpy() if HIDDEN_LAYER is not None
-                           else x_ant.flatten(start_dim=1).detach().cpu().numpy())
-    knn_pred = knn_proba.argmax(axis=1)
-    knn_acc = (knn_pred == y_eval.numpy()).astype("float").mean()
-    print("The accuracy by KNN on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,knn_acc))
+        knn = KNeighborsClassifier(n_neighbors=5,n_jobs=-1)
+        knn.fit(train_conv.flatten(start_dim=1).numpy()
+                if HIDDEN_LAYER is not None else x_train.flatten(start_dim=1).numpy(), y_train.numpy())
+        knn_proba = knn.predict_proba(ant_conv.flatten(start_dim=1).numpy()
+                               if HIDDEN_LAYER is not None else x_ant.flatten(start_dim=1).detach().cpu().numpy())
+        knn_pred = knn_proba.argmax(axis=1)
+        knn_acc = (knn_pred == y_eval.numpy()).astype("float").mean()
+        print("The accuracy by KNN on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,knn_acc))
 
     if SAVE_RESULT:
         timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d%H%M%S")
         if not os.path.exists("./results"):
             os.mkdir("./results")
-        with open("results/result_v2_{}_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,LAYER_NAME,N_EVAL,timestamp),"wb") as f:
+        with open("results/result_mnist_{}_{}_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,LAYER_NAME,N_TRAIN,N_EVAL,timestamp),"wb") as f:
             pickle.dump([aise_proba,knn_proba,ant_logs],f)
-        with open("results/bcells_v2_{}_{}_{}_{}.pkl".format(DATA_TYPE_SHORT, LAYER_NAME, N_EVAL,timestamp), "wb") as f:
-            pickle.dump([mem_bcs.detach().cpu().numpy(),pla_bcs.detach().cpu().numpy()],f)
+        with open("results/bcells_mnist_{}_{}_{}_{}_{}.pkl".format(DATA_TYPE_SHORT, LAYER_NAME,N_TRAIN,N_EVAL,timestamp), "wb") as f:
+            pickle.dump([mem_bcs,pla_bcs],f)
     else:
         print("The result is:")
         print("AISE:",aise_pred,"KNN",knn_pred)
