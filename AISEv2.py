@@ -269,7 +269,8 @@ class AISE:
                     for c in range(self.n_class):
                         pos = static_index[labels[parents_ind1.cpu()]==c]
                         if len(pos):
-                            parents_ind2_class = Categorical(probs=F.softmax(fitness_score[static_index[labels==c]] / self.sampl_temp,dim=-1)).sample((len(pos),))
+                            parents_ind2_class = Categorical(probs=F.softmax(fitness_score[static_index[labels==c]] / \
+                                                                             self.sampl_temp,dim=-1)).sample((len(pos),))
                             parents_ind2[pos] = static_index[labels==c][parents_ind2_class.cpu()]
                     parent_pairs = [curr_gen[parents_ind1],curr_gen[parents_ind2]]
                     curr_gen = genadapt(parent_pairs, fitness_score[parents_ind1] / \
@@ -333,12 +334,13 @@ class AISE:
 
     def clonal_expansion(self, ant, y_ant=None):
         print("Clonal expansion starts...")
-        ant_tran = self._hidden_repr_mapping(ant.detach())
-        nbc_ind = self._query_nns_ind(ant_tran.detach().cpu().numpy())
+        ant_tran = self._hidden_repr_mapping(ant).cpu()
+        nbc_ind = self._query_nns_ind(ant_tran.numpy())
         mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = self.generate_b_cells(ant.flatten(start_dim=1), ant_tran,
                                                                                nbc_ind, np.array(y_ant))
         if self.keep_memory:
-            print("{} plasma B cells and {} memory generated!".format(pla_bcs.shape[0]*self.n_plasma, mem_bcs.shape[0]*self.n_memory))
+            print("{} plasma B cells and {} memory generated!".format(pla_bcs.shape[0]*self.n_plasma,
+                                                                      mem_bcs.shape[0]*self.n_memory))
         else:
             print("{} plasma B cells generated!".format(pla_bcs.shape[0]*self.n_plasma))
         if self.return_log:
@@ -451,18 +453,18 @@ if __name__ == "__main__":
         if USE_CACHE:
             if os.path.exists("./cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS)):
                 with open("./cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS),"rb") as f:
-                    x_adv = torch.Tensor(pickle.load(f)).to(DEVICE)
+                    x_adv = torch.Tensor(pickle.load(f))
             else:
                 x_adv = PGD(eps=EPS/255.,sigma=20/255.,nb_iter=20,
-                            DEVICE=DEVICE).attack_batch(net,x_eval.to(DEVICE),y_eval.to(DEVICE))
+                            DEVICE=DEVICE).attack_batch(net,x_eval.to(DEVICE),y_eval.to(DEVICE)).detach().cpu()
                 with open("./cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS), "wb") as f:
-                    pickle.dump(x_adv.detach().cpu().numpy(), f)
+                    pickle.dump(x_adv.numpy(), f)
         else:
             x_adv = PGD(eps=EPS/255., sigma=20 / 255., nb_iter=20,
                         DEVICE=DEVICE).attack_batch(net, x_eval.to(DEVICE), y_eval.to(DEVICE))
         x_ant = x_adv
     else:
-        x_ant = x_eval.to(DEVICE)
+        x_ant = x_eval
 
     def feature_extractor(net,x,hidden_layer=-1,batch_size=2048,device=DEVICE):
         if hidden_layer == -1:  # return the last output of net

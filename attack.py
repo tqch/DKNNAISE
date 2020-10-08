@@ -145,10 +145,10 @@ class PGD(AttackBase):
 
         return adv_inp
 
-    def attack_batch(self, net, inp, label, target = None, batch_size = 64):
+    def attack_batch(self, net, inp, label, target=None, batch_size=512):
         adv_inps = []
         for i in range(0,inp.size(0),batch_size):
-            adv_inps.append(self.attack(net,inp[i:i+batch_size],label[i:i+batch_size],target).detach())
+            adv_inps.append(self.attack(net,inp[i:i+batch_size],label[i:i+batch_size],target).detach().cpu())
         return torch.cat(adv_inps)
 
     def to(self, device):
