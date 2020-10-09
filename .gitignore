@@ -1,10 +1,4 @@
-torch_practice.ipynb
 datasets
-datasets/MNIST
 images
-neural_style_tutorial.ipynb
-gram_fitness.ipynb
 cache
-AISE_gridsearch-Copy1.ipynb 
 results
-AISEv2_timer.py

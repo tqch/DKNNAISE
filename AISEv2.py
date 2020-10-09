@@ -278,10 +278,13 @@ class AISE:
                 else:
                     parents = curr_gen[parents_ind1]
                     curr_gen = genadapt(parents)
-                curr_repr = self._hidden_repr_mapping(curr_gen.view((-1,) + self.x_orig.size()[1:]))
-                labels = labels[parents_ind1.cpu()]
+
                 if self.apply_bound:
                     curr_gen = self.clip_class_bound(curr_gen,labels,class_center,class_bound)
+
+                curr_repr = self._hidden_repr_mapping(curr_gen.view((-1,) + self.x_orig.size()[1:]))
+                labels = labels[parents_ind1.cpu()]
+
                 fitness_score = self.fitness_func(ant_tran[n].unsqueeze(0).to(self.device), curr_repr.to(self.device))
                 pop_fitness = fitness_score.sum().item()
 
@@ -506,7 +509,35 @@ if __name__ == "__main__":
 
     if NO_KNN:
         knn_proba = None
+    elif USE_CACHE:
+        if os.path.exists("./cache/knn_proba_{}_{}_{}_{}.pkl".format(N_TRAIN,N_EVAL,LAYER_NAME,
+                                                    "after_normalization" if NORMALIZE else "before_normalization")):
+            with open("./cache/knn_proba_{}_{}_{}_{}.pkl".format(N_TRAIN,N_EVAL,LAYER_NAME,
+                                            "after_normalization" if NORMALIZE else "before_normalization"),"rb") as f:
+                knn_proba = pickle.load(f)
+        else:
+            net.to(DEVICE)
+            if HIDDEN_LAYER is not None:
+                train_conv = feature_extractor(net,x_train,HIDDEN_LAYER)
+                ant_conv = feature_extractor(net,x_ant,HIDDEN_LAYER)
+
+            if NORMALIZE:
+                x_train.div_(x_train.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
+                x_ant.div_(x_ant.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
+                if HIDDEN_LAYER is not None:
+                    train_conv = train_conv/train_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
+                    ant_conv = ant_conv/ant_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
+
+            knn = KNeighborsClassifier(n_neighbors=5,n_jobs=-1)
+            knn.fit(train_conv.flatten(start_dim=1).numpy()
+                    if HIDDEN_LAYER is not None else x_train.flatten(start_dim=1).numpy(), y_train.numpy())
+            knn_proba = knn.predict_proba(ant_conv.flatten(start_dim=1).numpy()
+                                   if HIDDEN_LAYER is not None else x_ant.flatten(start_dim=1).detach().cpu().numpy())
+            with open("./cache/knn_proba_{}_{}_{}_{}.pkl".format(N_TRAIN,N_EVAL,LAYER_NAME,
+                                                     "after_normalization" if NORMALIZE else "before_normalization"),"wb") as f:
+                pickle.dump(knn_proba,f)
     else:
+        net.to(DEVICE)
         if HIDDEN_LAYER is not None:
             train_conv = feature_extractor(net,x_train,HIDDEN_LAYER)
             ant_conv = feature_extractor(net,x_ant,HIDDEN_LAYER)
@@ -517,16 +548,15 @@ if __name__ == "__main__":
             if HIDDEN_LAYER is not None:
                 train_conv = train_conv/train_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
                 ant_conv = ant_conv/ant_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
+            knn = KNeighborsClassifier(n_neighbors=5,n_jobs=-1)
+            knn.fit(train_conv.flatten(start_dim=1).numpy()
+                    if HIDDEN_LAYER is not None else x_train.flatten(start_dim=1).numpy(), y_train.numpy())
+            knn_proba = knn.predict_proba(ant_conv.flatten(start_dim=1).numpy()
+                                   if HIDDEN_LAYER is not None else x_ant.flatten(start_dim=1).detach().cpu().numpy())
 
-
-        knn = KNeighborsClassifier(n_neighbors=5,n_jobs=-1)
-        knn.fit(train_conv.flatten(start_dim=1).numpy()
-                if HIDDEN_LAYER is not None else x_train.flatten(start_dim=1).numpy(), y_train.numpy())
-        knn_proba = knn.predict_proba(ant_conv.flatten(start_dim=1).numpy()
-                               if HIDDEN_LAYER is not None else x_ant.flatten(start_dim=1).detach().cpu().numpy())
-        knn_pred = knn_proba.argmax(axis=1)
-        knn_acc = (knn_pred == y_eval.numpy()).astype("float").mean()
-        print("The accuracy by KNN on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,knn_acc))
+    knn_pred = knn_proba.argmax(axis=1)
+    knn_acc = (knn_pred == y_eval.numpy()).astype("float").mean()
+    print("The accuracy by KNN on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,knn_acc))
 
     if SAVE_RESULT:
         timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d%H%M%S")
