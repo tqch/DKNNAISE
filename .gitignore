@@ -2,3 +2,5 @@ datasets
 images
 cache
 results
+adaptive_results
+adaptive_cache

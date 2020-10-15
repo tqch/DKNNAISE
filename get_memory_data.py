@@ -45,7 +45,17 @@ class GenAdapt:
         else:
             raise ValueError("Unsupported mutation type!")
 
-
+class MyTimer:
+    def __init__(self,title="default title"):
+        self.title = title
+    def __enter__(self):
+        self.start_time = time.perf_counter()
+        return self
+    def __exit__(self,*exc_args):
+        self.end_time = time.perf_counter()
+        print("{} ellapse time: {}".format(self.title,self.end_time-self.start_time))
+        
+            
 class L2NearestNeighbors(NearestNeighbors):
     '''
     compatible query object class for euclidean distance
@@ -53,6 +63,9 @@ class L2NearestNeighbors(NearestNeighbors):
 
     def __call__(self, X):
         return self.kneighbors(X, return_distance=False)
+
+# def neg_l2_dist(X, Y):
+#     return -euclidean_distances(X, Y)
 
 def neg_l2_dist(x,y):
     '''
@@ -74,7 +87,7 @@ class AISE:
                  avg_channel=False, fitness_function="negative l2", sampling_temperature=.3, adaptive_temp=False,
                  max_generation=50, requires_init=True, apply_bound=False,
                  mut_range=(.05, .15), mut_prob=(.05, .15), mut_mode="crossover",
-                 decay=(.9, .9), n_population=1000, memory_threshold=.25, plasma_threshold=.05,
+                 decay=(.9, .9), n_population=1000, memory_threshold=.25, plasma_threshold=.05, 
                  keep_memory=False, return_log=True):
 
         self.model = model
@@ -99,7 +112,7 @@ class AISE:
         self.fitness_func = self._get_fitness_func(fitness_function)
         self.sampl_temp = sampling_temperature
         self.adaptive_temp = adaptive_temp
-
+        
         self.max_generation = max_generation
         self.n_population = self.n_class * self.n_neighbors
         self.requires_init = requires_init
@@ -118,7 +131,7 @@ class AISE:
         self.n_population = n_population
         self.n_plasma = int(plasma_threshold*self.n_population)
         self.n_memory = int(memory_threshold*self.n_population)-self.n_plasma
-
+        
         self.keep_memory = keep_memory
         self.return_log = return_log
 
@@ -126,14 +139,12 @@ class AISE:
         self.model.eval()
 
         self._query_objects = self._build_all_query_objects()
-
+        
     def _get_fitness_func(self,func_str):
         if func_str == "negative l2":
             return neg_l2_dist
         elif func_str == "inner product":
             return inner_product
-        else:
-            raise ValueError("Unsupported fitness function type!")
 
     def _build_class_query_object(self, xh_orig, class_label=-1):
         if class_label + 1:
@@ -158,7 +169,7 @@ class AISE:
             query_objects = [self._build_class_query_object(xh_orig)]
             print("done!")
         return query_objects
-
+        
     def _query_nns_ind(self, Q):
         assert Q.ndim == 2, "Q: 2d array-like (n_queries,n_features)"
         if self.n_class:
@@ -177,7 +188,7 @@ class AISE:
             print('done!')
         return abs_ind
 
-    def _hidden_repr_mapping(self, x, batch_size=512, query=False):
+    def _hidden_repr_mapping(self, x, batch_size=2048, query=False):
         '''
         transform b cells and antigens into inner representations of AISE
         '''
@@ -186,11 +197,10 @@ class AISE:
             for i in range(0,x.size(0),batch_size):
                 xx = x[i:i+batch_size]
                 with torch.no_grad():
-                    *hidden_out, _ = self.model(xx.to(self.device))
                     if query:
-                        xh = hidden_out[self.hidden_layer].detach().cpu()
+                        xh = self.model.truncated_forward(xx.to(self.device),self.hidden_layer).detach().cpu()
                     else:
-                        xh = hidden_out[self.hidden_layer]
+                        xh = self.model.truncated_forward(xx.to(self.device),self.hidden_layer)
                     if self.avg_channel:
                         xh = xh.sum(dim=1)
                     xh = xh.flatten(start_dim=1)
@@ -206,7 +216,7 @@ class AISE:
 
     def clip_class_bound(self,x,y,class_center,class_bound):
         return torch.min(torch.max(x,(class_center-class_bound)[y]),(class_center+class_bound)[y])
-
+        
     def generate_b_cells(self, ant, ant_tran, nbc_ind, y_ant=None):
         assert ant_tran.ndim == 2, "ant: 2d tensor (n_antigens,n_features)"
         pla_bcs = []
@@ -231,7 +241,7 @@ class AISE:
                     class_center.append(torch.mean(curr_gen[i:i+self.n_neighbors],dim=0))
                     class_bound.append((curr_gen[i:i+self.n_neighbors]-class_center[-1]).abs().max(dim=0)[0])
                 class_center = torch.stack(class_center)
-                class_bound = torch.stack(class_bound)
+                class_bound = torch.stack(class_bound)            
             if self.requires_init:
                 assert self.n_population % (
                         self.n_class * self.n_neighbors) == 0, \
@@ -241,7 +251,7 @@ class AISE:
                 labels = np.tile(labels, self.n_population // (self.n_class * self.n_neighbors))
                 if self.apply_bound:
                     curr_gen = self.clip_class_bound(curr_gen,labels,class_center,class_bound)
-
+            
             curr_repr = self._hidden_repr_mapping(curr_gen.view((-1,) + self.x_orig.size()[1:]))
             fitness_score = self.fitness_func(ant_tran[n].unsqueeze(0).to(self.device), curr_repr.to(self.device))
             best_pop_fitness = float('-inf')
@@ -259,29 +269,28 @@ class AISE:
                 fitness_true_class_hist.append(true_class_fitness)
                 true_class_pct = (labels == y_ant[n]).astype('float').mean().item()
                 pct_true_class_hist.append(true_class_pct)
-
-            static_index = torch.LongTensor(torch.arange(len(labels))).to(self.device)  # static generation indices
+            
+            static_index = torch.LongTensor(torch.arange(len(labels))).to(self.device)
             for i in range(self.max_generation):
-                select_prob = F.softmax(fitness_score / self.sampl_temp, dim=-1)
-                parents_ind1 = Categorical(probs=select_prob).sample((self.n_population,))
+                survival_prob = F.softmax(fitness_score / self.sampl_temp, dim=-1)
+                parents_ind1 = Categorical(probs=survival_prob).sample((self.n_population,))    
                 if self.mut_mode == "crossover":
                     parents_ind2 = torch.zeros_like(parents_ind1)
                     for c in range(self.n_class):
                         pos = static_index[labels[parents_ind1.cpu()]==c]
                         if len(pos):
-                            parents_ind2_class = Categorical(probs=F.softmax(fitness_score[static_index[labels==c]] / \
-                                                                             self.sampl_temp,dim=-1)).sample((len(pos),))
+                            parents_ind2_class = Categorical(probs=F.softmax(fitness_score[static_index[labels==c]] / self.sampl_temp,dim=-1)).sample((len(pos),))
                             parents_ind2[pos] = static_index[labels==c][parents_ind2_class.cpu()]
                     parent_pairs = [curr_gen[parents_ind1],curr_gen[parents_ind2]]
-                    curr_gen = genadapt(parent_pairs, fitness_score[parents_ind1] / \
-                                        (fitness_score[parents_ind1] + fitness_score[parents_ind2]))
+                    curr_gen = genadapt(parent_pairs, fitness_score[parents_ind1] /\
+                                      (fitness_score[parents_ind1]+fitness_score[parents_ind2]))
                 else:
                     parents = curr_gen[parents_ind1]
                     curr_gen = genadapt(parents)
-
+                
                 if self.apply_bound:
-                    curr_gen = self.clip_class_bound(curr_gen,labels,class_center,class_bound)
-
+                    curr_gen = self.clip_class_bound(curr_gen,labels,class_center,class_bound) 
+                
                 curr_repr = self._hidden_repr_mapping(curr_gen.view((-1,) + self.x_orig.size()[1:]))
                 labels = labels[parents_ind1.cpu()]
 
@@ -323,27 +332,26 @@ class AISE:
             pla_bcs.append(curr_gen[fitness_rank[-self.n_plasma:]].detach().cpu())
             pla_labs.append(labels[fitness_rank[-self.n_plasma:]])
             if self.keep_memory:
-                mem_bcs.append(curr_gen[fitness_rank[-(self.n_memory+self.n_plasma):-self.n_plasma]].detach().cpu())
-                mem_labs.append(labels[fitness_rank[-(self.n_memory+self.n_plasma):-self.n_plasma]])
-            ant_logs.append(ant_log)
-
+                mem_bcs.append(curr_gen[fitness_rank[-(self.n_memory+self.n_plasma)+19:-self.n_plasma:20]].detach().cpu())
+                mem_labs.append(labels[fitness_rank[-(self.n_memory+self.n_plasma)+19:-self.n_plasma:20]])
+            ant_logs.append(ant_log)        
+        
         pla_bcs = torch.stack(pla_bcs).view((-1,self.n_plasma)+self.input_shape).numpy()
         pla_labs = np.stack(pla_labs)
         if self.keep_memory:
-            mem_bcs = torch.stack(mem_bcs).view((-1,self.n_mem)+self.input_shape).numpy()
+            mem_bcs = torch.stack(mem_bcs).view((-1,10)+self.input_shape).numpy()
             mem_labs = np.stack(mem_labs)
-
+        
         return mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs
 
     def clonal_expansion(self, ant, y_ant=None):
         print("Clonal expansion starts...")
-        ant_tran = self._hidden_repr_mapping(ant).cpu()
-        nbc_ind = self._query_nns_ind(ant_tran.numpy())
+        ant_tran = self._hidden_repr_mapping(ant.detach())
+        nbc_ind = self._query_nns_ind(ant_tran.detach().cpu().numpy())
         mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = self.generate_b_cells(ant.flatten(start_dim=1), ant_tran,
                                                                                nbc_ind, np.array(y_ant))
         if self.keep_memory:
-            print("{} plasma B cells and {} memory generated!".format(pla_bcs.shape[0]*self.n_plasma,
-                                                                      mem_bcs.shape[0]*self.n_memory))
+            print("{} plasma B cells and {} memory generated!".format(pla_bcs.shape[0]*self.n_plasma, mem_bcs.shape[0]*self.n_memory))
         else:
             print("{} plasma B cells generated!".format(pla_bcs.shape[0]*self.n_plasma))
         if self.return_log:
@@ -366,21 +374,19 @@ if __name__ == "__main__":
     import os,time,pickle
     from datetime import datetime
     from torchvision import transforms, datasets
-    from attack import *
-    from mnist_model import *
+    from attack import PGD
+    from mnist_modelv2 import CNN
     from sklearn.neighbors import KNeighborsClassifier
     from collections import deque
 
     import argparse
     parser = argparse.ArgumentParser("AISE Launcher")
     parser.add_argument("--class-num",help="Number of classes",type=int,default=10)
-    parser.add_argument("--train-size",help="Training size",type=int,default=2000)
+    parser.add_argument("--train-size",help="Training size",type=int,default=20000)
     parser.add_argument("--eval-size",help="Evaluation size",type=int,default=200)
     parser.add_argument("--n-neighbors",help="Number of ancestors for each class",type=int,default=10)
     parser.add_argument("--max-generation",help="Max number of generations",type=int,default=50)
-    parser.add_argument("--hidden-layer",help="Specify a hidden layer",type=int)
     parser.add_argument("--fitness-function",help="Specify a function used to calculate fitness score",default="negative l2")
-    parser.add_argument("--sampling-temp",help="Sampling temperature",type=float,default=0.3)
     parser.add_argument("--avg-channel",help="Whether to average the channels or not",action="store_true")
     parser.add_argument("--device", help="CPU/GPU device")
     parser.add_argument("--no-knn", help="Whether to skip knn or not",action="store_true")
@@ -392,7 +398,8 @@ if __name__ == "__main__":
     parser.add_argument("-b","--apply-bound",help="Whether to clip according to class bound",action="store_true")
     parser.add_argument("-t","--adaptive-temp",help="Whether to use heuristic sampling temperature or not",action="store_true")
     parser.add_argument("-k","--keep-memory",help="Whether to keep memory data or not",action="store_true")
-
+    
+    
     args = parser.parse_args()
 
     ROOT = "./datasets"
@@ -408,9 +415,7 @@ if __name__ == "__main__":
     MAX_GEN = args.max_generation
     APPLY_BOUND = args.apply_bound
     ADAPTIVE_TEMP = args.adaptive_temp
-    HIDDEN_LAYER = args.hidden_layer
     FITNESS_FUNC = args.fitness_function
-    SAMPL_TEMP = args.sampling_temp
     AVG_CHANNEL = args.avg_channel
     if args.device:
         DEVICE = torch.device(args.device)
@@ -423,8 +428,7 @@ if __name__ == "__main__":
     KEEP_MEMORY = args.keep_memory
     NO_KNN = args.no_knn
     EPS = args.attack_intensity
-
-    LAYER_NAME = "conv" + str(HIDDEN_LAYER + 1) if HIDDEN_LAYER is not None else "input"
+    
     DATA_TYPE = "adversarial" if ATTACK else "legitimate"
     DATA_TYPE_SHORT = "adv" if ATTACK else "clean"
 
@@ -436,34 +440,37 @@ if __name__ == "__main__":
 
     trainset = datasets.MNIST(root=ROOT,train=True,transform=TRANSFORM,download=False)
     testset = datasets.MNIST(root=ROOT,train=False,transform=TRANSFORM,download=False)
-
+    
     np.random.seed(1234)
     ind_train = np.arange(len(trainset))
     np.random.shuffle(ind_train)
     ind_train = ind_train[:N_TRAIN]
-
+    
     ind_eval = np.arange(len(testset))
     np.random.shuffle(ind_eval)
     ind_eval = ind_eval[:N_EVAL]
 
     x_train = trainset.data[ind_train].unsqueeze(1)/255.
     y_train = trainset.targets[ind_train]
+
     x_eval = testset.data[ind_eval].unsqueeze(1)/255.
     y_eval = testset.targets[ind_eval]
 
     net.to(DEVICE)
+    if not os.path.exists("adaptive_cache"):
+        os.mkdir("adaptive_cache")
     if ATTACK:
         if USE_CACHE:
-            if os.path.exists("./cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS)):
-                with open("./cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS),"rb") as f:
+            if os.path.exists("adaptive_cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS)):
+                with open("adaptive_cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS),"rb") as f:
                     x_adv = torch.Tensor(pickle.load(f))
             else:
                 x_adv = PGD(eps=EPS/255.,sigma=20/255.,nb_iter=20,
                             DEVICE=DEVICE).attack_batch(net,x_eval.to(DEVICE),y_eval.to(DEVICE))
-                with open("./cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS), "wb") as f:
+                with open("adaptive_cache/x_mnist_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,N_EVAL,EPS), "wb") as f:
                     pickle.dump(x_adv.detach().cpu().numpy(), f)
         else:
-            x_adv = PGD(eps=EPS/255., sigma=20 / 255., nb_iter=20,
+            x_adv = PGD(eps=EPS/255., sigma=20/255., nb_iter=20,
                         DEVICE=DEVICE).attack_batch(net, x_eval.to(DEVICE), y_eval.to(DEVICE))
         x_ant = x_adv
     else:
@@ -494,27 +501,49 @@ if __name__ == "__main__":
     else:
         print("The accuracy of plain cnn on clean data is: {}".format(
             (y_eval.numpy() == y_pred.detach().cpu().numpy()).astype("float").mean()))
+    
+    for HIDDEN_LAYER in range(4):
+        LAYER_NAME = "conv" + str(HIDDEN_LAYER + 1) if HIDDEN_LAYER is not None else "input"
+        SAMPL_TEMP = [3,18,18,72][HIDDEN_LAYER]
+        start_time = time.time()
+        aise = AISE(x_train,y_train,model=net,n_neighbors=N_NEIGH,hidden_layer=HIDDEN_LAYER,max_generation=MAX_GEN,normalize=NORMALIZE,
+                    avg_channel=AVG_CHANNEL,fitness_function=FITNESS_FUNC,sampling_temperature=SAMPL_TEMP,adaptive_temp=ADAPTIVE_TEMP,
+                    apply_bound=APPLY_BOUND,keep_memory=KEEP_MEMORY)
+        mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = aise(x_ant,y_eval)
+        end_time = time.time()
+        print("Total running time is {}".format(end_time-start_time))
+        aise_proba = AISE.predict_proba(pla_labs,n_class=N_CLASS)
+        aise_pred = aise_proba.argmax(axis=1)
+        aise_acc = (aise_pred==y_eval.numpy()).astype("float").mean()
+        print("The accuracy by AISE on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,aise_acc))
 
-    start_time = time.time()
-    aise = AISE(x_train,y_train,model=net,n_neighbors=N_NEIGH,hidden_layer=HIDDEN_LAYER,max_generation=MAX_GEN,normalize=NORMALIZE,
-                avg_channel=AVG_CHANNEL,fitness_function=FITNESS_FUNC,sampling_temperature=SAMPL_TEMP,adaptive_temp=ADAPTIVE_TEMP,
-                apply_bound=APPLY_BOUND,keep_memory=KEEP_MEMORY)
-    mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = aise(x_ant,y_eval)
-    end_time = time.time()
-    print("Total running time is {}".format(end_time-start_time))
-    aise_proba = AISE.predict_proba(pla_labs,n_class=N_CLASS)
-    aise_pred = aise_proba.argmax(axis=1)
-    aise_acc = (aise_pred==y_eval.numpy()).astype("float").mean()
-    print("The accuracy by AISE on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,aise_acc))
+        if NO_KNN:
+            knn_proba = None
+        elif USE_CACHE:
+            if os.path.exists("adaptive_cache/knn_proba_{}_{}_{}_{}{}{}.pkl".format(N_TRAIN,N_EVAL,LAYER_NAME,DATA_TYPE_SHORT, "_"+str(EPS) if ATTACK else "","_n" if NORMALIZE else "")):
+                with open("adaptive_cache/knn_proba_{}_{}_{}_{}{}{}.pkl".format(N_TRAIN,N_EVAL,LAYER_NAME,DATA_TYPE_SHORT, "_"+str(EPS) if ATTACK else "","_n" if NORMALIZE else ""),"rb") as f:
+                    knn_proba = pickle.load(f)
+            else:
+                net.to(DEVICE)
+                if HIDDEN_LAYER is not None:
+                    train_conv = feature_extractor(net,x_train,HIDDEN_LAYER)
+                    ant_conv = feature_extractor(net,x_ant,HIDDEN_LAYER)
 
-    if NO_KNN:
-        knn_proba = None
-    elif USE_CACHE:
-        if os.path.exists("cache/knn_proba_{}_{}_{}_{}{}{}.pkl".format(N_TRAIN,N_EVAL,LAYER_NAME,DATA_TYPE_SHORT,
-                                                                         "_"+str(EPS) if ATTACK else "","_n" if NORMALIZE else "")):
-            with open("cache/knn_proba_{}_{}_{}_{}_{}{}{}.pkl".format(N_TRAIN,N_EVAL,LAYER_NAME,DATA_TYPE_SHORT,
-                                                             "_"+str(EPS) if ATTACK else "","_n" if NORMALIZE else ""),"rb") as f:
-                knn_proba = pickle.load(f)
+                if NORMALIZE:
+                    x_train.div_(x_train.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
+                    x_ant.div_(x_ant.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
+                    if HIDDEN_LAYER is not None:
+                        train_conv = train_conv/train_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
+                        ant_conv = ant_conv/ant_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
+
+                knn = KNeighborsClassifier(n_neighbors=5,n_jobs=-1)
+                knn.fit(train_conv.flatten(start_dim=1).numpy()
+                        if HIDDEN_LAYER is not None else x_train.flatten(start_dim=1).numpy(), y_train.numpy())
+                knn_proba = knn.predict_proba(ant_conv.flatten(start_dim=1).numpy()
+                                       if HIDDEN_LAYER is not None else x_ant.flatten(start_dim=1).detach().cpu().numpy())
+                with open("adaptive_cache/knn_proba_{}_{}_{}_{}{}{}.pkl".format(N_TRAIN,N_EVAL,LAYER_NAME,DATA_TYPE_SHORT,
+                                                     "_"+str(EPS) if ATTACK else "","_n" if NORMALIZE else ""),"wb") as f:
+                    pickle.dump(knn_proba,f)
         else:
             net.to(DEVICE)
             if HIDDEN_LAYER is not None:
@@ -527,46 +556,25 @@ if __name__ == "__main__":
                 if HIDDEN_LAYER is not None:
                     train_conv = train_conv/train_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
                     ant_conv = ant_conv/ant_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
-
             knn = KNeighborsClassifier(n_neighbors=5,n_jobs=-1)
             knn.fit(train_conv.flatten(start_dim=1).numpy()
                     if HIDDEN_LAYER is not None else x_train.flatten(start_dim=1).numpy(), y_train.numpy())
             knn_proba = knn.predict_proba(ant_conv.flatten(start_dim=1).numpy()
                                    if HIDDEN_LAYER is not None else x_ant.flatten(start_dim=1).detach().cpu().numpy())
-            with open("cache/knn_proba_{}_{}_{}_{}{}.pkl".format(N_TRAIN,N_EVAL,LAYER_NAME,DATA_TYPE_SHORT,
-                                                     "_"+str(EPS) if ATTACK else "","_n" if NORMALIZE else ""),"wb") as f:
-                pickle.dump(knn_proba,f)
-    else:
-        net.to(DEVICE)
-        if HIDDEN_LAYER is not None:
-            train_conv = feature_extractor(net,x_train,HIDDEN_LAYER)
-            ant_conv = feature_extractor(net,x_ant,HIDDEN_LAYER)
 
-        if NORMALIZE:
-            x_train.div_(x_train.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
-            x_ant.div_(x_ant.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt())
-            if HIDDEN_LAYER is not None:
-                train_conv = train_conv/train_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
-                ant_conv = ant_conv/ant_conv.pow(2).sum(dim=(1,2,3),keepdim=True).sqrt()
-        knn = KNeighborsClassifier(n_neighbors=5,n_jobs=-1)
-        knn.fit(train_conv.flatten(start_dim=1).numpy()
-                if HIDDEN_LAYER is not None else x_train.flatten(start_dim=1).numpy(), y_train.numpy())
-        knn_proba = knn.predict_proba(ant_conv.flatten(start_dim=1).numpy()
-                               if HIDDEN_LAYER is not None else x_ant.flatten(start_dim=1).detach().cpu().numpy())
+        knn_pred = knn_proba.argmax(axis=1)
+        knn_acc = (knn_pred == y_eval.numpy()).astype("float").mean()
+        print("The accuracy by KNN on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,knn_acc))
 
-    knn_pred = knn_proba.argmax(axis=1)
-    knn_acc = (knn_pred == y_eval.numpy()).astype("float").mean()
-    print("The accuracy by KNN on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,knn_acc))
+        if SAVE_RESULT:
+            timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d%H%M%S")
+            if not os.path.exists("adaptive_results"):
+                os.mkdir("adaptive_results")
+            with open("adaptive_results/result_mnist_{}_{}_{}_{}{}_{}.pkl".format(DATA_TYPE_SHORT,LAYER_NAME,N_TRAIN,N_EVAL,"_"+str(EPS) if ATTACK else "",timestamp),"wb") as f:
+                pickle.dump([aise_proba,knn_proba,ant_logs],f)
+            with open("adaptive_results/bcells_mnist_{}_{}_{}_{}{}_{}.pkl".format(DATA_TYPE_SHORT,LAYER_NAME,N_TRAIN,N_EVAL,"_"+str(EPS) if ATTACK else "",timestamp), "wb") as f:
+                pickle.dump([mem_bcs,mem_labs],f)
 
-    if SAVE_RESULT:
-        timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d%H%M%S")
-        if not os.path.exists("./results"):
-            os.mkdir("./results")
-        with open("results/result_mnist_{}_{}_{}_{}_{}.pkl".format(DATA_TYPE_SHORT,LAYER_NAME,N_TRAIN,N_EVAL,timestamp),"wb") as f:
-            pickle.dump([aise_proba,knn_proba,ant_logs],f)
-        with open("results/bcells_mnist_{}_{}_{}_{}_{}.pkl".format(DATA_TYPE_SHORT, LAYER_NAME,N_TRAIN,N_EVAL,timestamp), "wb") as f:
-            pickle.dump([mem_bcs,mem_labs],f)
-    else:
-        print("The result is:")
-        print("AISE:",aise_pred,"KNN",knn_pred)
+    #     print("The result is:")
+    #     print("AISE:",aise_pred,"KNN",knn_pred)
         print(args)
