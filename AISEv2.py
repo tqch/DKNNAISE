@@ -5,6 +5,7 @@ from sklearn.neighbors import NearestNeighbors
 import numpy as np
 import math,time
 from collections import Counter
+import gc
 
 class GenAdapt:
     '''
@@ -495,17 +496,23 @@ if __name__ == "__main__":
         print("The accuracy of plain cnn on clean data is: {}".format(
             (y_eval.numpy() == y_pred.detach().cpu().numpy()).astype("float").mean()))
 
+    del out,y_pred
+    gc.collect()
+
     start_time = time.time()
     aise = AISE(x_train,y_train,model=net,n_neighbors=N_NEIGH,hidden_layer=HIDDEN_LAYER,max_generation=MAX_GEN,normalize=NORMALIZE,
                 avg_channel=AVG_CHANNEL,fitness_function=FITNESS_FUNC,sampling_temperature=SAMPL_TEMP,adaptive_temp=ADAPTIVE_TEMP,
                 apply_bound=APPLY_BOUND,keep_memory=KEEP_MEMORY)
-    mem_bcs, mem_labs, pla_bcs, pla_labs, ant_logs = aise(x_ant,y_eval)
+    mem_bcs, mem_labs, _, pla_labs, ant_logs = aise(x_ant,y_eval)
     end_time = time.time()
     print("Total running time is {}".format(end_time-start_time))
     aise_proba = AISE.predict_proba(pla_labs,n_class=N_CLASS)
     aise_pred = aise_proba.argmax(axis=1)
     aise_acc = (aise_pred==y_eval.numpy()).astype("float").mean()
     print("The accuracy by AISE on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,aise_acc))
+
+    del aise
+    gc.collect()
 
     if NO_KNN:
         knn_proba = None
@@ -557,6 +564,9 @@ if __name__ == "__main__":
     knn_pred = knn_proba.argmax(axis=1)
     knn_acc = (knn_pred == y_eval.numpy()).astype("float").mean()
     print("The accuracy by KNN on {} layer of {} examples is {}".format(LAYER_NAME,DATA_TYPE,knn_acc))
+
+    del knn
+    gc.collect()
 
     if SAVE_RESULT:
         timestamp = datetime.fromtimestamp(time.time()).strftime("%Y%m%d%H%M%S")
