@@ -7,10 +7,11 @@ import math,time
 from collections import Counter
 import gc
 
+
 class GenAdapt:
-    '''
+    """
     core component of AISE B-cell generation
-    '''
+    """
 
     def __init__(self, mut_range, mut_prob, mode='random'):
         self.mut_range = mut_range
@@ -48,27 +49,30 @@ class GenAdapt:
 
 
 class L2NearestNeighbors(NearestNeighbors):
-    '''
+    """
     compatible query object class for euclidean distance
-    '''
+    """
 
     def __call__(self, X):
         return self.kneighbors(X, return_distance=False)
 
+
 def neg_l2_dist(x,y):
-    '''
+    """
     x: (1,n_feature)
     y: (N,n_feature)
-    '''
+    """
     return -(x-y).pow(2).sum(dim=1).sqrt()
+
 
 def inner_product(X, Y):
     return (X@Y.T)[0]
 
+
 class AISE:
-    '''
+    """
     implement the Adaptive Immune System Emulation
-    '''
+    """
 
     def __init__(self, x_orig, y_orig, hidden_layer=None, model=None, input_shape=None, device=torch.device("cuda"),
                  n_class=10, n_neighbors=10, query_class="l2", norm_order=2, normalize=False,
@@ -179,9 +183,9 @@ class AISE:
         return abs_ind
 
     def _hidden_repr_mapping(self, x, batch_size=512, query=False):
-        '''
+        """
         transform b cells and antigens into inner representations of AISE
-        '''
+        """
         if self.hidden_layer is not None:
             xhs = []
             for i in range(0,x.size(0),batch_size):
@@ -362,6 +366,7 @@ class AISE:
 
     def __call__(self, ant, y_ant=None):
         return self.clonal_expansion(ant.detach(), y_ant)
+
 
 if __name__ == "__main__":
     import os,time,pickle
