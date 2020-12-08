@@ -1,6 +1,8 @@
-datasets
-images
-cache
-results
-adaptive_results
-adaptive_cache
+datasets/
+images/
+cache/
+results/
+adaptive_results/
+adaptive_cache/
+_ipynb/
+_unused/
